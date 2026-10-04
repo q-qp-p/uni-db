@@ -19,7 +19,7 @@ use uni_locy::result::DerivedEdge;
 use uni_locy::{CompiledProgram, FactRow, LocyError, LocyStats};
 
 use super::locy_ast_builder::build_derive_create;
-use super::locy_eval::eval_expr;
+use super::locy_eval::{eval_condition, eval_expr};
 use super::locy_traits::LocyExecutionContext;
 use crate::query::executor::result_normalizer::ResultNormalizer;
 
@@ -82,12 +82,9 @@ async fn collect_derive_facts_inner(
     let filtered: Vec<_> = if let Some(where_expr) = &dc.where_expr {
         facts
             .into_iter()
-            .filter(|row| {
-                eval_expr(where_expr, row)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            })
-            .collect()
+            .map(|row| Ok(eval_condition(where_expr, &row, "DERIVE WHERE")?.then_some(row)))
+            .filter_map(Result::transpose)
+            .collect::<Result<_, LocyError>>()?
     } else {
         facts
     };
@@ -110,7 +107,7 @@ async fn collect_derive_facts_inner(
                         &row,
                         &mut all_vertices,
                         &mut all_edges,
-                    );
+                    )?;
 
                     all_queries.extend(queries);
                 }
@@ -205,11 +202,11 @@ fn extract_vertex_edge_data(
     row: &FactRow,
     vertices: &mut HashMap<String, Vec<Properties>>,
     edges: &mut Vec<DerivedEdge>,
-) {
+) -> Result<(), LocyError> {
     match derive_clause {
         DeriveClause::Patterns(patterns) => {
             for pattern in patterns {
-                extract_from_pattern(pattern, row, vertices, edges);
+                extract_from_pattern(pattern, row, vertices, edges)?;
             }
         }
         DeriveClause::Merge(a, b) => {
@@ -226,6 +223,7 @@ fn extract_vertex_edge_data(
             });
         }
     }
+    Ok(())
 }
 
 /// Extract vertex/edge data from a single DerivePattern.
@@ -234,7 +232,7 @@ fn extract_from_pattern(
     row: &FactRow,
     vertices: &mut HashMap<String, Vec<Properties>>,
     edges: &mut Vec<DerivedEdge>,
-) {
+) -> Result<(), LocyError> {
     let source = &pattern.source;
     let target = &pattern.target;
     let edge = &pattern.edge;
@@ -266,11 +264,10 @@ fn extract_from_pattern(
             .push(target_props.clone());
     }
 
-    let edge_props = edge
-        .properties
-        .as_ref()
-        .and_then(|expr| eval_map_expr(expr, row))
-        .unwrap_or_default();
+    let edge_props = match &edge.properties {
+        Some(expr) => eval_map_expr(expr, row)?,
+        None => Properties::new(),
+    };
 
     edges.push(DerivedEdge {
         edge_type: edge.edge_type.clone(),
@@ -280,6 +277,7 @@ fn extract_from_pattern(
         target_properties: target_props,
         edge_properties: edge_props,
     });
+    Ok(())
 }
 
 /// Extract properties from a binding row for a node variable.
@@ -301,11 +299,16 @@ fn node_label_from_binding(var: &str, row: &FactRow) -> String {
     }
 }
 
-/// Try to evaluate a map expression to Properties.
-fn eval_map_expr(expr: &uni_cypher::ast::Expr, row: &FactRow) -> Option<Properties> {
+/// Evaluates a derived edge's property map.
+///
+/// An evaluation error, or a value that is not a map, is an error; both used to
+/// report the derived edge with no properties at all.
+fn eval_map_expr(expr: &uni_cypher::ast::Expr, row: &FactRow) -> Result<Properties, LocyError> {
     use uni_common::Value;
-    match eval_expr(expr, row) {
-        Ok(Value::Map(m)) => Some(m),
-        _ => None,
+    match eval_expr(expr, row)? {
+        Value::Map(m) => Ok(m),
+        other => Err(LocyError::TypeError {
+            message: format!("DERIVE edge properties must be a map, got {other:?}"),
+        }),
     }
 }

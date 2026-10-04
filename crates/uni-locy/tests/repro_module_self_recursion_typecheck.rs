@@ -11,10 +11,10 @@ use uni_locy::compile;
 // The exact program body below compiles cleanly WITHOUT a module (this is the
 // existing passing `phase_b_f1_suppressed_when_along_present` shape).
 const BODY: &str = "CREATE RULE r AS MATCH (a)-[e:E]->(b) ALONG total = e.weight \
-     YIELD a, b, total \
+     YIELD KEY a, KEY b, total \
      CREATE RULE r AS MATCH (a)-[e:E]->(mid) WHERE mid IS r TO b \
      ALONG total = prev.total + e.weight \
-     FOLD total = MSUM(total) YIELD a, b, total";
+     FOLD total = MSUM(total) YIELD KEY a, KEY b, total";
 
 #[test]
 fn module_qualified_self_recursion_wrongly_rejected() {

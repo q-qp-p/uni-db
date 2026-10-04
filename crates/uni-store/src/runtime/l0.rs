@@ -78,6 +78,18 @@ pub fn serialize_constraint_key(label: &str, key_values: &[(String, Value)]) -> 
     buf
 }
 
+/// The constraint a [`serialize_constraint_key`] key belongs to: its label and
+/// property names, without the values.
+fn constraint_key_shape(key: &[u8]) -> Vec<u8> {
+    // `label \0 (name \0 json-value \0)*`; JSON escapes control characters,
+    // so a value never contains a raw NUL.
+    key.split(|b| *b == 0)
+        .enumerate()
+        .filter(|(i, _)| *i == 0 || i % 2 == 1)
+        .flat_map(|(_, part)| part.iter().copied().chain(std::iter::once(0)))
+        .collect()
+}
+
 /// Per-type mutation counters accumulated by the L0 buffer.
 ///
 /// Used to provide detailed mutation statistics (e.g., `nodes_created`,
@@ -194,6 +206,12 @@ pub struct L0Buffer {
     /// Key: constraint composite key (label + sorted property values serialized).
     /// Value: Vid that owns this key.
     pub constraint_index: HashMap<Vec<u8>, Vid>,
+    /// Reverse of [`constraint_index`](Self::constraint_index): the keys each
+    /// vertex holds. Lets [`insert_constraint_key`](Self::insert_constraint_key)
+    /// retire a vertex's previous key for the same constraint when a `SET`
+    /// moves it; without it the old key stayed indexed to the vertex and was
+    /// reported as taken — at write time and again at commit.
+    pub constraint_keys_by_vid: HashMap<Vid, Vec<Vec<u8>>>,
     /// Implicit MERGE-key guard for phantom-free `MERGE` *without* a declared
     /// `UNIQUE` constraint. Same key format as `constraint_index` (built by
     /// [`serialize_constraint_key`]), but populated only by a `MERGE` that
@@ -303,6 +321,7 @@ impl Clone for L0Buffer {
             edge_updated_at: self.edge_updated_at.clone(),
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
+            constraint_keys_by_vid: self.constraint_keys_by_vid.clone(),
             edge_constraint_index: self.edge_constraint_index.clone(),
             merge_guard_index: self.merge_guard_index.clone(),
             extid_index: self.extid_index.clone(),
@@ -605,6 +624,7 @@ impl L0Buffer {
             edge_updated_at: HashMap::new(),
             estimated_size: 0,
             constraint_index: HashMap::new(),
+            constraint_keys_by_vid: HashMap::new(),
             edge_constraint_index: HashMap::new(),
             merge_guard_index: HashMap::new(),
             extid_index: HashMap::new(),
@@ -966,6 +986,7 @@ impl L0Buffer {
 
         // Remove constraint index entries for this vertex
         self.constraint_index.retain(|_, v| *v != vid);
+        self.constraint_keys_by_vid.remove(&vid);
         // Same for the implicit MERGE guard, so a later re-MERGE of a deleted
         // node's key does not false-conflict with the stale entry.
         self.merge_guard_index.retain(|_, v| *v != vid);
@@ -1372,7 +1393,28 @@ impl L0Buffer {
     }
 
     /// Insert a constraint key into the index for O(1) duplicate detection.
+    ///
+    /// A vertex holds one key per constraint, so a previous key of the same
+    /// shape (label and property names) is retired first.
     pub fn insert_constraint_key(&mut self, key: Vec<u8>, vid: Vid) {
+        let shape = constraint_key_shape(&key);
+        let held = self.constraint_keys_by_vid.entry(vid).or_default();
+        let mut retired = Vec::new();
+        held.retain(|old| {
+            let stale = *old != key && constraint_key_shape(old) == shape;
+            if stale {
+                retired.push(old.clone());
+            }
+            !stale
+        });
+        if !held.contains(&key) {
+            held.push(key.clone());
+        }
+        for old in retired {
+            if self.constraint_index.get(&old) == Some(&vid) {
+                self.constraint_index.remove(&old);
+            }
+        }
         self.constraint_index.insert(key, vid);
     }
 
@@ -1606,7 +1648,7 @@ impl L0Buffer {
 
         // Merge constraint index
         for (key, vid) in &other.constraint_index {
-            self.constraint_index.insert(key.clone(), *vid);
+            self.insert_constraint_key(key.clone(), *vid);
         }
 
         // Merge the implicit MERGE-key guard so a committed MERGE-create is

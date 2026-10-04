@@ -13,7 +13,10 @@ use std::ops::Range;
 
 use proptest::prelude::*;
 
-use crate::ir::{Generated, IsRef, OracleClause, OracleProgram, OracleRule, Tuple};
+use crate::ir::{
+    Agg, Computed, FoldAgg, Generated, IsRef, OracleBest, OracleClause, OracleFold, OracleProgram,
+    OracleRule, PROB_SCALE, ProbComplement, Tuple,
+};
 
 /// Closed-form transitive-closure cardinality of [`build_layered_dag`].
 ///
@@ -85,9 +88,14 @@ const REACHES_PROGRAM: &str = concat!(
 /// The `reaches` rule IR: `reaches(a,b) :- EDGE(a,b)` ∪ `EDGE(a,mid), reaches(mid,b)`.
 fn reaches_rule(edges: &[Tuple]) -> OracleRule {
     OracleRule {
+        per_path: false,
+        best: None,
+        fold: None,
         name: "reaches".to_string(),
         clauses: vec![
             OracleClause {
+                computed: Vec::new(),
+                prob_complements: Vec::new(),
                 base: edges.to_vec(),
                 var_cols: var_cols(&[("a", 0), ("b", 1)]),
                 pos_refs: Vec::new(),
@@ -95,9 +103,12 @@ fn reaches_rule(edges: &[Tuple]) -> OracleRule {
                 yield_vars: vec!["a".to_string(), "b".to_string()],
             },
             OracleClause {
+                computed: Vec::new(),
+                prob_complements: Vec::new(),
                 base: edges.to_vec(),
                 var_cols: var_cols(&[("a", 0), ("mid", 1)]),
                 pos_refs: vec![IsRef {
+                    values: Vec::new(),
                     rule: "reaches".to_string(),
                     subjects: vec!["mid".to_string()],
                     target: Some("b".to_string()),
@@ -174,12 +185,18 @@ pub fn build_complement(stages: usize, width: usize) -> Generated {
     // unreached(a, b) :- all-pairs(a, b), NOT reaches(a, b). Negation keys on the
     // full (a, b) tuple, so subjects carries both bound variables.
     let unreached = OracleRule {
+        per_path: false,
+        best: None,
+        fold: None,
         name: "unreached".to_string(),
         clauses: vec![OracleClause {
+            computed: Vec::new(),
+            prob_complements: Vec::new(),
             base: all_pairs(node_count),
             var_cols: var_cols(&[("a", 0), ("b", 1)]),
             pos_refs: Vec::new(),
             neg_refs: vec![IsRef {
+                values: Vec::new(),
                 rule: "reaches".to_string(),
                 subjects: vec!["a".to_string(), "b".to_string()],
                 target: None,
@@ -226,6 +243,8 @@ pub fn build_union(stages: usize, width: usize) -> Generated {
     .to_string();
 
     let clause = |base: Vec<Tuple>| OracleClause {
+        computed: Vec::new(),
+        prob_complements: Vec::new(),
         base,
         var_cols: var_cols(&[("a", 0), ("b", 1)]),
         pos_refs: Vec::new(),
@@ -238,6 +257,9 @@ pub fn build_union(stages: usize, width: usize) -> Generated {
         program_text,
         oracle_rules: OracleProgram {
             strata: vec![vec![OracleRule {
+                per_path: false,
+                best: None,
+                fold: None,
                 name: "linked".to_string(),
                 clauses: vec![clause(forward), clause(reverse)],
             }]],
@@ -262,6 +284,619 @@ pub fn layered_dag_strategy(
     width: Range<usize>,
 ) -> impl Strategy<Value = Generated> {
     (stages, width).prop_map(|(s, w)| build_layered_dag(s, w))
+}
+
+// ---------------------------------------------------------------------------
+// Random programs over a multigraph
+// ---------------------------------------------------------------------------
+
+/// One generated edge: `(src id, dst id, weight, second type?)`.
+pub type RandomEdge = (i64, i64, i64, bool);
+
+/// The shape a random program takes, drawn by [`random_program_strategy`].
+#[derive(Debug, Clone)]
+pub struct RandomShape {
+    /// Node count; ids are `0..nodes`.
+    pub nodes: usize,
+    /// Edges, parallel edges and self-loops included.
+    pub edges: Vec<RandomEdge>,
+    /// `link` (and so `reach`) follows edges backwards.
+    pub reverse: bool,
+    /// `link` also follows the second edge type.
+    pub union: bool,
+    /// Emit `un` = node pairs `reach` does not relate.
+    pub negation: bool,
+    /// Which FOLD rules to emit: `deg`, `span`, `flow`.
+    pub folds: [bool; 3],
+    /// Emit `cost` (per-path `ALONG`) and `tot` (a FOLD over its paths).
+    pub along: bool,
+    /// Emit `roll`, a recursive FOLD that reads its children's folded value.
+    pub rollup: bool,
+    /// Emit `best`: `ALONG` with `BEST BY` — `Some(true)` the shortest path
+    /// over every edge (cycles included), `Some(false)` the longest over the
+    /// acyclic edges.
+    pub best: Option<bool>,
+    /// Emit the PROB rules: `pr` (a PROB column), `nor` / `prd` (MNOR / MPROD
+    /// over edges) and `safe` (a probabilistic `IS NOT nor`).
+    pub prob: bool,
+}
+
+/// Random programs over a random multigraph.
+///
+/// The graph has self-loops, parallel edges (identical ones included) and two
+/// relationship types with integer weights. The program stacks, in strata:
+///
+/// * `link(a, b)`: an edge, forward or backward, of the first type or both;
+/// * `reach(a, b)`: the transitive closure of the same edges (a set);
+/// * `un(a, b)`: node pairs `reach` does not relate (stratified `IS NOT`);
+/// * FOLD rules, each over a **bag** of rows: `deg` over the first type's edges
+///   (`COUNT(*)`, `SUM`, `MIN`, `MAX`, `COUNT`), `span` over `reach`
+///   (`COUNT(*)`, `MAX`, `MMIN`), and `flow` over an edge joined with `reach`
+///   (`COUNT(*)`, `MSUM`, `MCOUNT`).
+///
+/// # Examples
+/// ```
+/// use uni_locy_oracle::generator::random_program_strategy;
+/// let _strategy = random_program_strategy();
+/// ```
+pub fn random_program_strategy() -> impl Strategy<Value = Generated> {
+    (2usize..9)
+        .prop_flat_map(|nodes| {
+            let n = nodes as i64;
+            (
+                Just(nodes),
+                proptest::collection::vec((0..n, 0..n, 1i64..6, any::<bool>()), 0..20),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<[bool; 3]>(),
+                any::<[bool; 3]>(),
+                proptest::option::of(any::<bool>()),
+            )
+        })
+        .prop_map(
+            |(nodes, edges, reverse, union, negation, folds, [along, rollup, prob], best)| {
+                build_random_program(&RandomShape {
+                    nodes,
+                    edges,
+                    reverse,
+                    union,
+                    negation,
+                    folds,
+                    along,
+                    rollup,
+                    best,
+                    prob,
+                })
+            },
+        )
+}
+
+/// Builds the program, graph and oracle IR for one [`RandomShape`].
+#[must_use]
+pub fn build_random_program(shape: &RandomShape) -> Generated {
+    // Base tuples: [src, dst, edge index, weight], per relationship type. The
+    // edge index keeps parallel edges distinct rows of the bag.
+    let typed = |second: bool| -> Vec<Tuple> {
+        shape
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.3 == second)
+            .map(|(i, e)| vec![e.0, e.1, i as i64, e.2])
+            .collect()
+    };
+    let (first, second) = (typed(false), typed(true));
+    let (a_col, b_col) = if shape.reverse { (1, 0) } else { (0, 1) };
+    let arrow = |ty: &str| {
+        if shape.reverse {
+            format!("<-[:{ty}]-")
+        } else {
+            format!("-[:{ty}]->")
+        }
+    };
+    let mut kinds: Vec<(&str, &Vec<Tuple>)> = vec![("EDGE", &first)];
+    if shape.union {
+        kinds.push(("EDGE2", &second));
+    }
+
+    let mut text: Vec<String> = Vec::new();
+    let mut key_schema: HashMap<String, Vec<String>> = HashMap::new();
+    let ab = || vec!["a".to_string(), "b".to_string()];
+
+    // link
+    let mut link = OracleRule {
+        per_path: false,
+        best: None,
+        fold: None,
+        name: "link".to_string(),
+        clauses: Vec::new(),
+    };
+    for (ty, base) in &kinds {
+        text.push(format!(
+            "CREATE RULE link AS MATCH (a:Node){}(b:Node) YIELD KEY a, KEY b",
+            arrow(ty)
+        ));
+        link.clauses.push(OracleClause {
+            computed: Vec::new(),
+            prob_complements: Vec::new(),
+            base: (*base).clone(),
+            var_cols: var_cols(&[("a", a_col), ("b", b_col)]),
+            pos_refs: Vec::new(),
+            neg_refs: Vec::new(),
+            yield_vars: ab(),
+        });
+    }
+    key_schema.insert("link".to_string(), ab());
+
+    // reach
+    let mut reach = OracleRule {
+        per_path: false,
+        best: None,
+        fold: None,
+        name: "reach".to_string(),
+        clauses: Vec::new(),
+    };
+    for (ty, base) in &kinds {
+        text.push(format!(
+            "CREATE RULE reach AS MATCH (a:Node){}(b:Node) YIELD KEY a, KEY b",
+            arrow(ty)
+        ));
+        text.push(format!(
+            "CREATE RULE reach AS MATCH (a:Node){}(m:Node) WHERE m IS reach TO b YIELD KEY a, KEY b",
+            arrow(ty)
+        ));
+        reach.clauses.push(OracleClause {
+            computed: Vec::new(),
+            prob_complements: Vec::new(),
+            base: (*base).clone(),
+            var_cols: var_cols(&[("a", a_col), ("b", b_col)]),
+            pos_refs: Vec::new(),
+            neg_refs: Vec::new(),
+            yield_vars: ab(),
+        });
+        reach.clauses.push(OracleClause {
+            computed: Vec::new(),
+            prob_complements: Vec::new(),
+            base: (*base).clone(),
+            var_cols: var_cols(&[("a", a_col), ("m", b_col)]),
+            pos_refs: vec![IsRef {
+                values: Vec::new(),
+                rule: "reach".to_string(),
+                subjects: vec!["m".to_string()],
+                target: Some("b".to_string()),
+            }],
+            neg_refs: Vec::new(),
+            yield_vars: ab(),
+        });
+    }
+    key_schema.insert("reach".to_string(), ab());
+
+    let mut strata = vec![vec![link], vec![reach]];
+
+    if shape.negation {
+        text.push(
+            "CREATE RULE un AS MATCH (a:Node), (b:Node) WHERE a IS NOT reach TO b YIELD KEY a, KEY b"
+                .to_string(),
+        );
+        strata.push(vec![OracleRule {
+            per_path: false,
+            best: None,
+            fold: None,
+            name: "un".to_string(),
+            clauses: vec![OracleClause {
+                computed: Vec::new(),
+                prob_complements: Vec::new(),
+                base: all_pairs(shape.nodes),
+                var_cols: var_cols(&[("a", 0), ("b", 1)]),
+                pos_refs: Vec::new(),
+                neg_refs: vec![IsRef {
+                    values: Vec::new(),
+                    rule: "reach".to_string(),
+                    subjects: ab(),
+                    target: None,
+                }],
+                yield_vars: ab(),
+            }],
+        }]);
+        key_schema.insert("un".to_string(), ab());
+    }
+
+    let agg = |agg: Agg, input: Option<usize>| FoldAgg { agg, input };
+    let mut folds: Vec<OracleRule> = Vec::new();
+
+    // The acyclic part of the first type: edges to a greater id. Per-path
+    // values and a recursive MSUM only converge without cycles.
+    let dag: Vec<Tuple> = first.iter().filter(|e| e[0] < e[1]).cloned().collect();
+    let all_nodes: Vec<Tuple> = (0..shape.nodes as i64).map(|id| vec![id]).collect();
+    let computed = |name: &str, vars: &[&str], constant: i64| Computed {
+        name: name.to_string(),
+        vars: vars.iter().map(|v| (*v).to_string()).collect(),
+        factor: 1,
+        constant,
+    };
+    // `<rule>(a, b, v)`: an edge's weight, or an edge followed by a fact of the
+    // rule itself, adding the weight to its value (`prev.v + e.w`).
+    let path_clauses = |rule: &str, base: &Vec<Tuple>| {
+        vec![
+            OracleClause {
+                base: base.clone(),
+                var_cols: var_cols(&[("a", 0), ("b", 1), ("w", 3)]),
+                pos_refs: Vec::new(),
+                neg_refs: Vec::new(),
+                yield_vars: vec!["a".to_string(), "b".to_string(), "v".to_string()],
+                computed: vec![computed("v", &["w"], 0)],
+                prob_complements: Vec::new(),
+            },
+            OracleClause {
+                base: base.clone(),
+                var_cols: var_cols(&[("a", 0), ("m", 1), ("w", 3)]),
+                pos_refs: vec![IsRef {
+                    rule: rule.to_string(),
+                    subjects: vec!["m".to_string()],
+                    target: Some("b".to_string()),
+                    values: vec!["p".to_string()],
+                }],
+                neg_refs: Vec::new(),
+                yield_vars: vec!["a".to_string(), "b".to_string(), "v".to_string()],
+                computed: vec![computed("v", &["p", "w"], 0)],
+                prob_complements: Vec::new(),
+            },
+        ]
+    };
+
+    if shape.along {
+        text.push(
+            "CREATE RULE cost AS MATCH (a:Node)-[e:EDGE]->(b:Node) WHERE a.id < b.id \
+             ALONG q = e.w YIELD KEY a, KEY b, q"
+                .to_string(),
+        );
+        text.push(
+            "CREATE RULE cost AS MATCH (a:Node)-[e:EDGE]->(m:Node) WHERE a.id < m.id, m IS cost TO b \
+             ALONG q = prev.q + e.w YIELD KEY a, KEY b, q"
+                .to_string(),
+        );
+        strata.push(vec![OracleRule {
+            name: "cost".to_string(),
+            clauses: path_clauses("cost", &dag),
+            fold: None,
+            per_path: true,
+            best: None,
+        }]);
+        key_schema.insert(
+            "cost".to_string(),
+            ["a", "b", "q"].map(String::from).to_vec(),
+        );
+
+        text.push(
+            "CREATE RULE tot AS MATCH (a:Node) WHERE a IS cost TO b \
+             FOLD n = COUNT(*), s = SUM(q) YIELD KEY a, n, s"
+                .to_string(),
+        );
+        folds.push(OracleRule {
+            name: "tot".to_string(),
+            clauses: vec![OracleClause {
+                base: all_nodes.clone(),
+                var_cols: var_cols(&[("a", 0)]),
+                pos_refs: vec![IsRef {
+                    rule: "cost".to_string(),
+                    subjects: vec!["a".to_string()],
+                    target: Some("b".to_string()),
+                    values: vec!["q".to_string()],
+                }],
+                neg_refs: Vec::new(),
+                yield_vars: vec!["a".to_string(), "q".to_string()],
+                computed: Vec::new(),
+                prob_complements: Vec::new(),
+            }],
+            fold: Some(OracleFold {
+                key_count: 1,
+                aggs: vec![agg(Agg::CountStar, None), agg(Agg::Sum, Some(1))],
+            }),
+            per_path: false,
+            best: None,
+        });
+        key_schema.insert(
+            "tot".to_string(),
+            ["a", "n", "s"].map(String::from).to_vec(),
+        );
+    }
+
+    if shape.rollup {
+        text.push("CREATE RULE roll AS MATCH (a:Node) YIELD KEY a, 1 AS s".to_string());
+        text.push(
+            "CREATE RULE roll AS MATCH (a:Node)-[e:EDGE]->(c:Node) WHERE a.id < c.id, c IS roll \
+             FOLD s = MSUM(s + e.w) YIELD KEY a, s"
+                .to_string(),
+        );
+        strata.push(vec![OracleRule {
+            name: "roll".to_string(),
+            clauses: vec![
+                OracleClause {
+                    base: all_nodes.clone(),
+                    var_cols: var_cols(&[("a", 0)]),
+                    pos_refs: Vec::new(),
+                    neg_refs: Vec::new(),
+                    yield_vars: vec!["a".to_string(), "s".to_string()],
+                    computed: vec![computed("s", &[], 1)],
+                    prob_complements: Vec::new(),
+                },
+                OracleClause {
+                    base: dag.clone(),
+                    var_cols: var_cols(&[("a", 0), ("c", 1), ("w", 3)]),
+                    pos_refs: vec![IsRef {
+                        rule: "roll".to_string(),
+                        subjects: vec!["c".to_string()],
+                        target: None,
+                        values: vec!["cs".to_string()],
+                    }],
+                    neg_refs: Vec::new(),
+                    yield_vars: vec!["a".to_string(), "x".to_string()],
+                    computed: vec![computed("x", &["cs", "w"], 0)],
+                    prob_complements: Vec::new(),
+                },
+            ],
+            fold: Some(OracleFold {
+                key_count: 1,
+                aggs: vec![agg(Agg::Sum, Some(1))],
+            }),
+            per_path: false,
+            best: None,
+        }]);
+        key_schema.insert("roll".to_string(), ["a", "s"].map(String::from).to_vec());
+    }
+
+    if let Some(ascending) = shape.best {
+        let (filter, recursive_filter, order, base) = if ascending {
+            ("", "", "ASC", &first)
+        } else {
+            (" WHERE a.id < b.id", "a.id < m.id, ", "DESC", &dag)
+        };
+        text.push(format!(
+            "CREATE RULE opt AS MATCH (a:Node)-[e:EDGE]->(b:Node){filter} \
+             ALONG d = e.w BEST BY d {order} YIELD KEY a, KEY b, d"
+        ));
+        text.push(format!(
+            "CREATE RULE opt AS MATCH (a:Node)-[e:EDGE]->(m:Node) WHERE {recursive_filter}m IS opt TO b \
+             ALONG d = prev.d + e.w BEST BY d {order} YIELD KEY a, KEY b, d"
+        ));
+        strata.push(vec![OracleRule {
+            name: "opt".to_string(),
+            clauses: path_clauses("opt", base),
+            fold: None,
+            per_path: false,
+            best: Some(OracleBest {
+                key_count: 2,
+                criterion: 2,
+                ascending,
+            }),
+        }]);
+        key_schema.insert(
+            "opt".to_string(),
+            ["a", "b", "d"].map(String::from).to_vec(),
+        );
+    }
+    if shape.folds[0] {
+        text.push(
+            "CREATE RULE deg AS MATCH (a:Node)-[e:EDGE]->(b:Node) \
+             FOLD n = COUNT(*), s = SUM(e.w), lo = MIN(e.w), hi = MAX(e.w), c = COUNT(e.w) \
+             YIELD KEY a, n, s, lo, hi, c"
+                .to_string(),
+        );
+        folds.push(OracleRule {
+            per_path: false,
+            best: None,
+            name: "deg".to_string(),
+            clauses: vec![OracleClause {
+                computed: Vec::new(),
+                prob_complements: Vec::new(),
+                base: first.clone(),
+                var_cols: var_cols(&[("a", 0), ("w", 3)]),
+                pos_refs: Vec::new(),
+                neg_refs: Vec::new(),
+                yield_vars: vec!["a".to_string(), "w".to_string()],
+            }],
+            fold: Some(OracleFold {
+                key_count: 1,
+                aggs: vec![
+                    agg(Agg::CountStar, None),
+                    agg(Agg::Sum, Some(1)),
+                    agg(Agg::Min, Some(1)),
+                    agg(Agg::Max, Some(1)),
+                    agg(Agg::Count, Some(1)),
+                ],
+            }),
+        });
+        key_schema.insert(
+            "deg".to_string(),
+            ["a", "n", "s", "lo", "hi", "c"].map(String::from).to_vec(),
+        );
+    }
+    if shape.folds[1] {
+        text.push(
+            "CREATE RULE span AS MATCH (a:Node) WHERE a IS reach TO b \
+             FOLD n = COUNT(*), hi = MAX(b.id), lo = MMIN(b.id) YIELD KEY a, n, hi, lo"
+                .to_string(),
+        );
+        folds.push(OracleRule {
+            per_path: false,
+            best: None,
+            name: "span".to_string(),
+            clauses: vec![OracleClause {
+                computed: Vec::new(),
+                prob_complements: Vec::new(),
+                base: (0..shape.nodes as i64).map(|id| vec![id]).collect(),
+                var_cols: var_cols(&[("a", 0)]),
+                pos_refs: vec![IsRef {
+                    values: Vec::new(),
+                    rule: "reach".to_string(),
+                    subjects: vec!["a".to_string()],
+                    target: Some("b".to_string()),
+                }],
+                neg_refs: Vec::new(),
+                yield_vars: ab(),
+            }],
+            fold: Some(OracleFold {
+                key_count: 1,
+                aggs: vec![
+                    agg(Agg::CountStar, None),
+                    agg(Agg::Max, Some(1)),
+                    agg(Agg::Min, Some(1)),
+                ],
+            }),
+        });
+        key_schema.insert(
+            "span".to_string(),
+            ["a", "n", "hi", "lo"].map(String::from).to_vec(),
+        );
+    }
+    if shape.folds[2] {
+        text.push(
+            "CREATE RULE flow AS MATCH (a:Node)-[e:EDGE]->(m:Node) WHERE m IS reach TO b \
+             FOLD n = COUNT(*), s = MSUM(e.w), k = MCOUNT(b.id) YIELD KEY a, n, s, k"
+                .to_string(),
+        );
+        folds.push(OracleRule {
+            per_path: false,
+            best: None,
+            name: "flow".to_string(),
+            clauses: vec![OracleClause {
+                computed: Vec::new(),
+                prob_complements: Vec::new(),
+                base: first.clone(),
+                var_cols: var_cols(&[("a", 0), ("m", 1), ("w", 3)]),
+                pos_refs: vec![IsRef {
+                    values: Vec::new(),
+                    rule: "reach".to_string(),
+                    subjects: vec!["m".to_string()],
+                    target: Some("b".to_string()),
+                }],
+                neg_refs: Vec::new(),
+                yield_vars: vec!["a".to_string(), "w".to_string(), "b".to_string()],
+            }],
+            fold: Some(OracleFold {
+                key_count: 1,
+                aggs: vec![
+                    agg(Agg::CountStar, None),
+                    agg(Agg::Sum, Some(1)),
+                    agg(Agg::Count, Some(2)),
+                ],
+            }),
+        });
+        key_schema.insert(
+            "flow".to_string(),
+            ["a", "n", "s", "k"].map(String::from).to_vec(),
+        );
+    }
+    let mut after_folds: Vec<OracleRule> = Vec::new();
+    if shape.prob {
+        // A probability `e.w / 10.0`, in PROB_SCALE units.
+        let tenths = |name: &str, var: &str| Computed {
+            name: name.to_string(),
+            vars: vec![var.to_string()],
+            factor: PROB_SCALE / 10,
+            constant: 0,
+        };
+        let edge_prob = || OracleClause {
+            base: first.clone(),
+            var_cols: var_cols(&[("a", 0), ("b", 1), ("w", 3)]),
+            pos_refs: Vec::new(),
+            neg_refs: Vec::new(),
+            yield_vars: vec!["a".to_string(), "b".to_string(), "pb".to_string()],
+            computed: vec![tenths("pb", "w")],
+            prob_complements: Vec::new(),
+        };
+        let abp = || ["a", "b", "pb"].map(String::from).to_vec();
+        text.push(
+            "CREATE RULE pr AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b, e.w / 10.0 AS pb PROB"
+                .to_string(),
+        );
+        strata.push(vec![OracleRule {
+            name: "pr".to_string(),
+            clauses: vec![edge_prob()],
+            fold: None,
+            per_path: false,
+            best: None,
+        }]);
+        key_schema.insert("pr".to_string(), abp());
+        for (name, function, aggregate) in [
+            ("nor", "MNOR", Agg::NoisyOr),
+            ("prd", "MPROD", Agg::Product),
+        ] {
+            text.push(format!(
+                "CREATE RULE {name} AS MATCH (a:Node)-[e:EDGE]->(b:Node) \
+                 FOLD pb = {function}(e.w / 10.0) YIELD KEY a, KEY b, pb"
+            ));
+            folds.push(OracleRule {
+                name: name.to_string(),
+                clauses: vec![edge_prob()],
+                fold: Some(OracleFold {
+                    key_count: 2,
+                    aggs: vec![agg(aggregate, Some(2))],
+                }),
+                per_path: false,
+                best: None,
+            });
+            key_schema.insert(name.to_string(), abp());
+        }
+        text.push(
+            "CREATE RULE safe AS MATCH (a:Node), (b:Node) WHERE a IS NOT nor TO b \
+             YIELD KEY a, KEY b, 1.0 AS pb PROB"
+                .to_string(),
+        );
+        after_folds.push(OracleRule {
+            name: "safe".to_string(),
+            clauses: vec![OracleClause {
+                base: all_pairs(shape.nodes),
+                var_cols: var_cols(&[("a", 0), ("b", 1)]),
+                pos_refs: Vec::new(),
+                neg_refs: Vec::new(),
+                yield_vars: abp(),
+                computed: vec![Computed {
+                    name: "pb".to_string(),
+                    vars: Vec::new(),
+                    factor: 1,
+                    constant: PROB_SCALE,
+                }],
+                prob_complements: vec![ProbComplement {
+                    reference: IsRef {
+                        rule: "nor".to_string(),
+                        subjects: vec!["a".to_string(), "b".to_string()],
+                        target: None,
+                        values: Vec::new(),
+                    },
+                    prob_column: 2,
+                    prob_var: "pb".to_string(),
+                }],
+            }],
+            fold: None,
+            per_path: false,
+            best: None,
+        });
+        key_schema.insert("safe".to_string(), abp());
+    }
+    if !folds.is_empty() {
+        strata.push(folds);
+    }
+    if !after_folds.is_empty() {
+        strata.push(after_folds);
+    }
+
+    // The graph: nodes, then each edge with its weight.
+    let mut parts: Vec<String> = (0..shape.nodes)
+        .map(|id| format!("(n{id}:Node {{id: {id}}})"))
+        .collect();
+    for (src, dst, w, second) in &shape.edges {
+        let ty = if *second { "EDGE2" } else { "EDGE" };
+        parts.push(format!("(n{src})-[:{ty} {{w: {w}}}]->(n{dst})"));
+    }
+
+    Generated {
+        base_graph_cypher: format!("CREATE {}", parts.join(", ")),
+        program_text: text.join("\n"),
+        oracle_rules: OracleProgram { strata },
+        key_schema,
+    }
 }
 
 #[cfg(test)]

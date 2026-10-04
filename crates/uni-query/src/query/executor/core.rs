@@ -651,6 +651,15 @@ impl Executor {
     /// When `transaction_l0_override` is set, it is used as the transaction L0 —
     /// this is how private-per-transaction L0 buffers become visible to reads
     /// without requiring the writer lock at tx creation.
+    /// The L0 buffers this executor's reads see (current, pending flush and
+    /// any transaction-local buffer), or none when it has no L0 at all.
+    pub(crate) async fn visible_l0(&self) -> uni_store::runtime::l0_visibility::L0Context {
+        self.get_context()
+            .await
+            .map(|ctx| uni_store::runtime::l0_visibility::L0Context::from_query_context(&ctx))
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn get_context(&self) -> Option<QueryContext> {
         if let Some(writer) = &self.writer {
             // Prefer the override (private tx L0) over the writer's slot

@@ -87,6 +87,8 @@ fn mean_rows_per_side(tier: Tier) -> usize {
         Tier::Tiny => 1_959,
         Tier::Smoke => 19_517,
         Tier::Large => 97_559,
+        // Measured: 1 873 520 rows over 150 `flush_wide_smoke` cases, both sides.
+        Tier::Wide => 6_245,
     }
 }
 
@@ -97,6 +99,7 @@ fn max_rows_per_side(tier: Tier) -> usize {
         Tier::Tiny => 4_000,
         Tier::Smoke => 40_000,
         Tier::Large => 200_000,
+        Tier::Wide => 36_000,
     }
 }
 

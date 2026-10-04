@@ -2280,12 +2280,21 @@ impl Stream for GraphScanStream {
                                 let storage = Arc::clone(self.graph_ctx.storage());
                                 let label = self.label.clone();
                                 let schemaless = self.is_schemaless;
+                                // Unflushed rows are read by the same walk, so
+                                // they count toward its size. Flushed storage
+                                // alone sized an all-L0 label as empty and built
+                                // it whole, whether or not a flush had landed.
+                                let l0_rows = self
+                                    .graph_ctx
+                                    .l0_context()
+                                    .vertex_count((!schemaless).then_some(label.as_str()));
                                 self.state = GraphScanState::Sizing(Box::pin(async move {
-                                    if schemaless {
-                                        storage.main_vertex_row_count().await.map_err(exec_err)
+                                    let flushed = if schemaless {
+                                        storage.main_vertex_row_count().await.map_err(exec_err)?
                                     } else {
-                                        storage.vertex_row_count(&label).await.map_err(exec_err)
-                                    }
+                                        storage.vertex_row_count(&label).await.map_err(exec_err)?
+                                    };
+                                    Ok(flushed.map(|rows| rows.saturating_add(l0_rows)))
                                 }));
                             } else {
                                 self.state = GraphScanState::Executing {
@@ -2468,9 +2477,20 @@ impl Stream for GraphScanStream {
                                         && width
                                             >= (self.slice_size as u64)
                                                 .saturating_mul(SEEK_MIN_WIDTH_FACTOR);
+                                    // Flushed storage cannot see unflushed rows,
+                                    // and vids are allocated across labels, so a
+                                    // label's newer rows can lie past a gap its
+                                    // flushed rows never reach. Asking storage
+                                    // alone ended the walk in that gap and
+                                    // silently dropped every row above it.
+                                    let l0_next =
+                                        self.graph_ctx.l0_context().min_vertex_vid_at_or_above(
+                                            (!schemaless).then_some(label.as_str()),
+                                            next_lo,
+                                        );
                                     self.state = GraphScanState::ConfirmingEnd {
                                         fut: Box::pin(async move {
-                                            if seek {
+                                            let flushed = if seek {
                                                 // A schemaless walk is over the
                                                 // shared table, so its gap seek
                                                 // has to ask that table too --
@@ -2507,7 +2527,16 @@ impl Stream for GraphScanStream {
                                                     }
                                                 })
                                                 .map_err(exec_err)
-                                            }
+                                            }?;
+                                            Ok(match (flushed, l0_next) {
+                                                (SeekOutcome::Exhausted, Some(vid)) => {
+                                                    SeekOutcome::ResumeAt(vid)
+                                                }
+                                                (SeekOutcome::ResumeAt(a), Some(b)) => {
+                                                    SeekOutcome::ResumeAt(a.min(b))
+                                                }
+                                                (outcome, _) => outcome,
+                                            })
                                         }),
                                         lo: next_lo,
                                         width,

@@ -230,11 +230,23 @@ impl<'a> SchemaBuilder<'a> {
                         // above also keeps re-registration off the row-count
                         // path entirely.
                         None => {
+                            // Unflushed rows exist too; see `existing_row_count`.
+                            let l0 = self
+                                .db
+                                .inner
+                                .writer
+                                .as_ref()
+                                .map(|w| uni_store::runtime::l0_visibility::L0Context {
+                                    current_l0: Some(w.l0_manager.get_current()),
+                                    transaction_l0: None,
+                                    pending_flush_l0s: w.l0_manager.get_pending_flush(),
+                                })
+                                .unwrap_or_default();
                             let rows = self
                                 .db
                                 .inner
                                 .storage
-                                .materialized_row_count(&label_or_type)
+                                .existing_row_count(&label_or_type, &l0)
                                 .await
                                 .map_err(UniError::Internal)?;
                             if nullable || rows == 0 {

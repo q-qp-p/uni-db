@@ -208,8 +208,14 @@ fn compile_with_context(
     // Assemble strata in topological order
     let mut strata = Vec::new();
     for &scc_idx in &strat.scc_order {
-        let scc_rules: Vec<_> = strat.sccs[scc_idx]
-            .iter()
+        // A strongly connected component is a set; sort it so a stratum's
+        // rules — and so everything that depends on their order, from the
+        // fixpoint's per-rule states to the output schema — are the same on
+        // every run.
+        let mut scc_names: Vec<&String> = strat.sccs[scc_idx].iter().collect();
+        scc_names.sort();
+        let scc_rules: Vec<_> = scc_names
+            .into_iter()
             .filter_map(|name| compiled_rules.get(name).cloned())
             .collect();
 
@@ -252,6 +258,67 @@ fn compile_with_context(
 /// Extract non-rule statements as compiled commands, validating rule references.
 /// Returns the commands and any extra warnings emitted by command
 /// compilation (e.g., Phase C C4 `EceBinningBias`).
+/// Rejects a QUERY whose WHERE, RETURN or ORDER BY names a variable that its
+/// rule does not yield (issue #293).
+///
+/// ORDER BY may also name a RETURN alias. Variables bound inside a list
+/// comprehension, quantifier or `reduce` are local to it and are not checked.
+/// A rule with no YIELD schema (a DERIVE rule) is left alone.
+fn check_query_variables(
+    rule_name: &str,
+    rule: &crate::types::CompiledRule,
+    query: &uni_cypher::locy_ast::GoalQuery,
+) -> Result<(), LocyCompileError> {
+    use uni_cypher::ast::{Expr, ReturnItem};
+
+    if rule.yield_schema.is_empty() {
+        return Ok(());
+    }
+    let columns: Vec<String> = rule.yield_schema.iter().map(|c| c.name.clone()).collect();
+
+    fn free_vars(expr: &Expr, out: &mut Vec<String>) {
+        if let Expr::Variable(v) = expr {
+            out.push(v.clone());
+        }
+        expr.for_each_child_in_scope(&mut |child| free_vars(child, out));
+    }
+
+    let mut referenced = Vec::new();
+    let mut aliases = Vec::new();
+    if let Some(w) = &query.where_expr {
+        free_vars(w, &mut referenced);
+    }
+    let mut order_refs = Vec::new();
+    if let Some(rc) = &query.return_clause {
+        for item in &rc.items {
+            if let ReturnItem::Expr { expr, alias, .. } = item {
+                free_vars(expr, &mut referenced);
+                aliases.extend(alias.iter().cloned());
+            }
+        }
+        for sort in rc.order_by.iter().flatten() {
+            free_vars(&sort.expr, &mut order_refs);
+        }
+    }
+
+    let unknown = referenced
+        .iter()
+        .find(|v| !columns.contains(v))
+        .or_else(|| {
+            order_refs
+                .iter()
+                .find(|v| !columns.contains(v) && !aliases.contains(v))
+        });
+    match unknown {
+        Some(variable) => Err(LocyCompileError::UnknownQueryVariable {
+            rule: rule_name.to_string(),
+            variable: variable.clone(),
+            available: columns,
+        }),
+        None => Ok(()),
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Threads the compile context (rules, modules, catalogs, preview gate, warning sink) plus the caller's monotonicity oracle into command extraction; grouping into a struct would just move the argument list."
@@ -282,6 +349,10 @@ fn extract_commands(
             LocyStatement::Rule(_) => {} // handled by group_rules
             LocyStatement::GoalQuery(gq) => {
                 validate_rule(&gq.rule_name.to_string())?;
+                let resolved = modules::resolve_rule_name(module_ctx, &gq.rule_name.to_string());
+                if let Some(rule) = rule_catalog.get(&resolved) {
+                    check_query_variables(&resolved, rule, gq)?;
+                }
                 commands.push(CompiledCommand::GoalQuery(gq.clone()));
             }
             LocyStatement::ExplainRule(eq) => {
@@ -672,9 +743,9 @@ mod tests {
     #[test]
     fn step6_non_monotonic_in_recursion() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS total \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 0 AS total \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD total = SUM(a.cost) YIELD a, b, total",
+             FOLD total = SUM(a.cost) YIELD KEY a, KEY b, total",
         )
         .unwrap();
 
@@ -694,9 +765,9 @@ mod tests {
     #[test]
     fn step7_msum_warning() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS total \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 0 AS total \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD total = MSUM(a.weight) YIELD a, b, total",
+             FOLD total = MSUM(a.weight) YIELD KEY a, KEY b, total",
         )
         .unwrap();
 
@@ -720,9 +791,9 @@ mod tests {
     #[test]
     fn step8_best_by_with_monotonic_fold() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS total \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 0 AS total \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD total = MSUM(a.cost) BEST BY total ASC YIELD a, b, total",
+             FOLD total = MSUM(a.cost) BEST BY total ASC YIELD KEY a, KEY b, total",
         )
         .unwrap();
 
@@ -742,9 +813,9 @@ mod tests {
     #[test]
     fn mnor_probability_domain_warning() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS score \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 0 AS score \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD score = MNOR(a.weight) YIELD a, b, score",
+             FOLD score = MNOR(a.weight) YIELD KEY a, KEY b, score",
         )
         .unwrap();
 
@@ -762,9 +833,9 @@ mod tests {
     #[test]
     fn mnor_best_by_rejected() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS score \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 0 AS score \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD score = MNOR(a.weight) BEST BY score ASC YIELD a, b, score",
+             FOLD score = MNOR(a.weight) BEST BY score ASC YIELD KEY a, KEY b, score",
         )
         .unwrap();
 
@@ -873,9 +944,9 @@ mod tests {
     #[test]
     fn mprod_probability_domain_warning() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 1 AS score \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 1 AS score \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD score = MPROD(a.weight) YIELD a, b, score",
+             FOLD score = MPROD(a.weight) YIELD KEY a, KEY b, score",
         )
         .unwrap();
 
@@ -1222,9 +1293,9 @@ mod tests {
     fn phase_b_f1_fold_in_recursive_path_without_along() {
         // The very same shape as step7_msum_warning — F1 must fire.
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS total \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 0 AS total \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD total = MSUM(a.weight) YIELD a, b, total",
+             FOLD total = MSUM(a.weight) YIELD KEY a, KEY b, total",
         )
         .unwrap();
         let compiled = compile(&prog).unwrap();
@@ -1393,9 +1464,9 @@ mod tests {
     #[test]
     fn issue_265_a_recursive_fold_without_having_warns_only_about_the_fold() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS total \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD KEY a, KEY b, 0 AS total \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD total = MSUM(a.weight) YIELD a, b, total",
+             FOLD total = MSUM(a.weight) YIELD KEY a, KEY b, total",
         )
         .unwrap();
         let compiled = compile(&prog).unwrap();
@@ -1431,10 +1502,10 @@ mod tests {
         // recommend, so the ALONG case is now warned about too.
         let prog = parse_locy(
             "CREATE RULE r AS MATCH (a)-[e:E]->(b) ALONG total = e.weight \
-             YIELD a, b, total \
+             YIELD KEY a, KEY b, total \
              CREATE RULE r AS MATCH (a)-[e:E]->(mid) WHERE mid IS r TO b \
              ALONG total = prev.total + e.weight \
-             FOLD total = MSUM(total) YIELD a, b, total",
+             FOLD total = MSUM(total) YIELD KEY a, KEY b, total",
         )
         .unwrap();
         let compiled = compile(&prog).unwrap();

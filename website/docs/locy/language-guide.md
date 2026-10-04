@@ -103,6 +103,18 @@ See [Neural Predicates](advanced/neural-predicates.md) for the full reference (e
 QUERY reachable WHERE a.name = 'Alice' RETURN b
 ```
 
+`RETURN` takes Cypher's projection forms. An aggregate groups the rows by the
+returned items that are not aggregates, as Cypher's `RETURN` does, and with no
+such item an empty result is still one row:
+
+```locy
+QUERY reachable RETURN a.name AS from, count(*) AS n, collect(b.name) AS to
+  ORDER BY n DESC LIMIT $k
+```
+
+A `WHERE` that cannot be evaluated, or is not a boolean, is an error rather
+than a filter that drops every row.
+
 ## DERIVE in Rules (Graph Mutation)
 
 Rules can use `DERIVE` instead of `YIELD` to directly write graph mutations:

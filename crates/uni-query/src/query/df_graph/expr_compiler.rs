@@ -55,6 +55,26 @@ fn is_cypher_value_type(dt: Option<&DataType>) -> bool {
 /// # Errors
 ///
 /// Returns an error if the data type is not a recognized list type.
+/// The schema a `reduce` body sees: the input, with the accumulator and loop
+/// variable added (shadowing outer columns of the same names).
+fn reduce_inner_schema(
+    input_schema: &Schema,
+    accumulator: &str,
+    acc_type: DataType,
+    variable: &str,
+    element_type: DataType,
+) -> Schema {
+    let mut fields = input_schema.fields().to_vec();
+    for (name, data_type) in [(accumulator, acc_type), (variable, element_type)] {
+        let field = Arc::new(Field::new(name, data_type, true));
+        match fields.iter().position(|f| f.name() == name) {
+            Some(pos) => fields[pos] = field,
+            None => fields.push(field),
+        }
+    }
+    Schema::new(fields)
+}
+
 fn resolve_list_element_type(
     list_data_type: &DataType,
     large_binary_fallback: DataType,
@@ -190,6 +210,121 @@ impl PhysicalExpr for LargeListToCypherValueExpr {
     fn fmt_sql(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "LargeListToCypherValue({})", self.child)
     }
+}
+
+/// Physical expression wrapper that encodes any value as a Cypher value
+/// (`LargeBinary`), row by row.
+///
+/// A Cypher value carries its own type per row, which a typed Arrow column
+/// cannot. `reduce` needs that when its accumulator's type is not fixed — an
+/// untyped `null` start, or a body that turns an integer into a float.
+#[derive(Debug)]
+struct ToCypherValueExpr {
+    child: Arc<dyn PhysicalExpr>,
+}
+
+impl std::fmt::Display for ToCypherValueExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ToCypherValue({})", self.child)
+    }
+}
+
+impl PartialEq for ToCypherValueExpr {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.child, &other.child)
+    }
+}
+
+impl Eq for ToCypherValueExpr {}
+
+impl std::hash::Hash for ToCypherValueExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::any::type_name::<Self>().hash(state);
+    }
+}
+
+impl PartialEq<dyn std::any::Any> for ToCypherValueExpr {
+    fn eq(&self, other: &dyn std::any::Any) -> bool {
+        other
+            .downcast_ref::<Self>()
+            .map(|x| self == x)
+            .unwrap_or(false)
+    }
+}
+
+impl PhysicalExpr for ToCypherValueExpr {
+    fn data_type(&self, _input_schema: &Schema) -> datafusion::error::Result<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> datafusion::error::Result<bool> {
+        self.child.nullable(input_schema)
+    }
+
+    fn evaluate(
+        &self,
+        batch: &arrow_array::RecordBatch,
+    ) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
+        use datafusion::logical_expr::ColumnarValue;
+
+        let array = self.child.evaluate(batch)?.into_array(batch.num_rows())?;
+        match array.data_type() {
+            DataType::LargeBinary => Ok(ColumnarValue::Array(array)),
+            _ => {
+                // `logical_nulls`, not `is_null`: a `NullArray` has no null
+                // buffer, so `is_null` calls every row valid, and encoding that
+                // row gives a non-null blob holding NULL, which `IS NULL` misses.
+                let nulls = array.logical_nulls();
+                let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
+                for row in 0..array.len() {
+                    if nulls.as_ref().is_some_and(|n| n.is_null(row)) {
+                        builder.append_null();
+                        continue;
+                    }
+                    let value = uni_store::storage::arrow_convert::arrow_to_value(
+                        array.as_ref(),
+                        row,
+                        None,
+                    )
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                    builder.append_value(uni_common::cypher_value_codec::encode(&value));
+                }
+                Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+            }
+        }
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.child]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
+        match <[_; 1]>::try_from(children) {
+            Ok([child]) => Ok(Arc::new(ToCypherValueExpr { child })),
+            Err(_) => Err(datafusion::error::DataFusionError::Execution(
+                "ToCypherValueExpr expects exactly 1 child".to_string(),
+            )),
+        }
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ToCypherValue({})", self.child)
+    }
+}
+
+/// `expr` as a Cypher value, unless it already is one.
+fn as_cypher_value(
+    expr: Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
+    Ok(if expr.data_type(schema)? == DataType::LargeBinary {
+        expr
+    } else {
+        Arc::new(ToCypherValueExpr { child: expr })
+    })
 }
 
 /// Compiler for converting Cypher expressions directly to DataFusion Physical Expressions.
@@ -409,6 +544,25 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         self.params = params;
         self.outer_entity_vars = outer_entity_vars;
         self
+    }
+
+    /// Compiles a Cypher expression used as a predicate (`WHERE`).
+    ///
+    /// A dynamically typed (CypherValue) result is read as a boolean through
+    /// `_cv_to_bool`, as `NOT` and `CASE WHEN` already read one: true keeps the
+    /// row, false and NULL drop it, and anything else is a type error. Without
+    /// it, `WHERE n.b` over a schemaless property failed to plan even when
+    /// every `b` was a boolean.
+    pub fn compile_predicate(
+        &self,
+        expr: &Expr,
+        input_schema: &Schema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let compiled = self.compile(expr, input_schema)?;
+        if matches!(compiled.data_type(input_schema), Ok(DataType::LargeBinary)) {
+            return self.wrap_with_cv_to_bool(compiled);
+        }
+        Ok(compiled)
     }
 
     /// Compile a Cypher expression into a DataFusion PhysicalExpr.
@@ -780,10 +934,12 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         var_name: &str,
         field_name: &str,
         input_schema: &Schema,
-    ) -> Option<Arc<dyn PhysicalExpr>> {
-        let col_idx = input_schema.index_of(var_name).ok()?;
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Ok(col_idx) = input_schema.index_of(var_name) else {
+            return Ok(None);
+        };
         let DataType::Struct(struct_fields) = input_schema.field(col_idx).data_type() else {
-            return None;
+            return Ok(None);
         };
         let col_expr: Arc<dyn PhysicalExpr> = Arc::new(
             datafusion::physical_expr::expressions::Column::new(var_name, col_idx),
@@ -791,41 +947,48 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
 
         if let Some(field_idx) = struct_fields.iter().position(|f| f.name() == field_name) {
             let output_type = struct_fields[field_idx].data_type().clone();
-            return Some(Arc::new(StructFieldAccessExpr::new(
+            return Ok(Some(Arc::new(StructFieldAccessExpr::new(
                 col_expr,
                 field_idx,
                 output_type,
-            )));
+            ))));
         }
 
-        if let Some(expr) = self.try_compile_struct_property(&col_expr, struct_fields, field_name) {
-            return Some(expr);
+        if let Some(expr) =
+            self.try_compile_struct_property(&col_expr, struct_fields, field_name)?
+        {
+            return Ok(Some(expr));
         }
 
         // Cypher semantics: accessing a missing key returns null. Type it as
         // LargeBinary (an encoded CypherValue null) rather than `ScalarValue::Null`
         // so the value composes with the CypherValue list/comparison machinery —
         // an untyped null cannot be encoded into a result list.
-        Some(Arc::new(
+        Ok(Some(Arc::new(
             datafusion::physical_expr::expressions::Literal::new(
                 datafusion::common::ScalarValue::LargeBinary(None),
             ),
-        ))
+        )))
     }
 
     /// Look a name up inside an entity struct's `properties` CypherValue blob.
     ///
     /// Returns `None` when the struct has no such blob (an ordinary struct, where
-    /// a missing field really is a missing key).
+    /// a missing field really is a missing key). Failing to plan the lookup is
+    /// an error: it used to read as "no blob", so the property compiled to a
+    /// NULL literal.
     fn try_compile_struct_property(
         &self,
         col_expr: &Arc<dyn PhysicalExpr>,
         struct_fields: &arrow_schema::Fields,
         field_name: &str,
-    ) -> Option<Arc<dyn PhysicalExpr>> {
-        let props_idx = struct_fields
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(props_idx) = struct_fields
             .iter()
-            .position(|f| f.name() == "properties" && *f.data_type() == DataType::LargeBinary)?;
+            .position(|f| f.name() == "properties" && *f.data_type() == DataType::LargeBinary)
+        else {
+            return Ok(None);
+        };
 
         let props_expr: Arc<dyn PhysicalExpr> = Arc::new(StructFieldAccessExpr::new(
             col_expr.clone(),
@@ -843,9 +1006,9 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             key_expr,
             DataType::LargeBinary,
             DataType::Utf8,
-        )
-        .ok()
-        .flatten()
+        )?
+        .map(Some)
+        .ok_or_else(|| anyhow!("UDF `index` is not registered"))
     }
 
     /// Compile property access on a struct column (e.g. `x.a` where `x` is Struct).
@@ -857,7 +1020,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         if let Expr::Variable(var_name) = base {
             // 1. Try struct field access (e.g. `x.a` where `x` is a Struct column)
-            if let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema) {
+            if let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema)? {
                 return Ok(expr);
             }
             // 2. Try flat column "{var}.{prop}" (for pattern comprehension inner schemas)
@@ -962,7 +1125,13 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 acc.extend(free_variables(e)?);
                 Some(acc)
             })
-            .is_some_and(|read| read.is_subset(&pattern_vars));
+            .is_some_and(|read| read.is_subset(&pattern_vars))
+            // A pattern variable bound in the outer row ties the answer to that
+            // row even when the body reads nothing else from outside.
+            && !pattern_vars.iter().any(|v| {
+                input_schema.column_with_name(&format!("{v}._vid")).is_some()
+                    || input_schema.column_with_name(v).is_some()
+            });
 
         Ok(Arc::new(PatternComprehensionSubqueryExpr {
             query,
@@ -992,7 +1161,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         if let Expr::Variable(var_name) = array
             && let Expr::Literal(CypherLiteral::String(prop)) = index
-            && let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema)
+            && let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema)?
         {
             return Ok(expr);
         }
@@ -1081,6 +1250,9 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         input_schema: &Schema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let pattern = extract_pattern_from_exists_query(query)?;
+        if let Some(reason) = fast_path_unsupported(&pattern, input_schema, FastPath::Exists) {
+            anyhow::bail!("pattern predicate not vectorizable: {reason}");
+        }
 
         let graph_ctx = self
             .graph_ctx
@@ -1748,51 +1920,91 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         input_schema: &Schema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let list_phy = self.compile(list, input_schema)?;
-
         let initial_phy = self.compile(initial, input_schema)?;
-        let acc_type = initial_phy.data_type(input_schema)?;
-
+        let init_type = initial_phy.data_type(input_schema)?;
         let list_data_type = list_phy.data_type(input_schema)?;
-        // For LargeBinary (CypherValue arrays), use the accumulator type as element type so the
-        // reduce body expression compiles correctly (e.g. acc + x where both are Int64).
-        let inner_data_type =
-            resolve_list_element_type(&list_data_type, acc_type.clone(), "Reduce")?;
 
-        // Create inner schema with accumulator and loop variable (shadow outer variables if same names)
-        let mut fields = input_schema.fields().to_vec();
-
-        let acc_field = Arc::new(Field::new(accumulator, acc_type, true));
-        if let Some(pos) = fields.iter().position(|f| f.name() == accumulator) {
-            fields[pos] = acc_field;
-        } else {
-            fields.push(acc_field);
+        // Typed only when both the elements' type is known and the body keeps
+        // the accumulator's type. Otherwise the accumulator, the elements of an
+        // untyped list, and the body's result are all Cypher values, which carry
+        // a type per row. Decoding an untyped list *as the accumulator's type*
+        // truncated floats to integers — `reduce(s = 0, v IN [1.5, 2.5] | s + v)`
+        // returned 3 — and an untyped `null` start could not hold anything.
+        let element_type =
+            resolve_list_element_type(&list_data_type, DataType::LargeBinary, "Reduce")?;
+        let typed = element_type != DataType::LargeBinary && init_type != DataType::Null;
+        if typed
+            && let Ok(reduce) = self.compile_reduce_body(
+                accumulator,
+                init_type.clone(),
+                variable,
+                element_type.clone(),
+                reduce_expr,
+                input_schema,
+            )
+            && reduce.data_type(&reduce_inner_schema(
+                input_schema,
+                accumulator,
+                init_type.clone(),
+                variable,
+                element_type.clone(),
+            ))? == init_type
+        {
+            return Ok(Arc::new(ReduceExecExpr::new(
+                accumulator.to_string(),
+                initial_phy,
+                variable.to_string(),
+                list_phy,
+                reduce,
+                Arc::new(input_schema.clone()),
+                init_type,
+            )));
         }
 
-        let var_field = Arc::new(Field::new(variable, inner_data_type, true));
-        if let Some(pos) = fields.iter().position(|f| f.name() == variable) {
-            fields[pos] = var_field;
-        } else {
-            fields.push(var_field);
-        }
-
-        let inner_schema = Arc::new(Schema::new(fields));
-
-        // Compile reduce expression with scoped translation context
-        let mut scoped_ctx = None;
-        let reduce_compiler = self.scoped_compiler(&[accumulator, variable], &mut scoped_ctx);
-
-        let reduce_phy = reduce_compiler.compile(reduce_expr, &inner_schema)?;
-        let output_type = reduce_phy.data_type(&inner_schema)?;
-
+        let initial_phy = as_cypher_value(initial_phy, input_schema)?;
+        let inner_schema = reduce_inner_schema(
+            input_schema,
+            accumulator,
+            DataType::LargeBinary,
+            variable,
+            element_type.clone(),
+        );
+        let reduce = self.compile_reduce_body(
+            accumulator,
+            DataType::LargeBinary,
+            variable,
+            element_type,
+            reduce_expr,
+            input_schema,
+        )?;
+        let reduce = as_cypher_value(reduce, &inner_schema)?;
         Ok(Arc::new(ReduceExecExpr::new(
             accumulator.to_string(),
             initial_phy,
             variable.to_string(),
             list_phy,
-            reduce_phy,
+            reduce,
             Arc::new(input_schema.clone()),
-            output_type,
+            DataType::LargeBinary,
         )))
+    }
+
+    /// Compiles a `reduce` body with the accumulator and loop variable typed
+    /// as given.
+    fn compile_reduce_body(
+        &self,
+        accumulator: &str,
+        acc_type: DataType,
+        variable: &str,
+        element_type: DataType,
+        reduce_expr: &Expr,
+        input_schema: &Schema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let inner_schema =
+            reduce_inner_schema(input_schema, accumulator, acc_type, variable, element_type);
+        let mut scoped_ctx = None;
+        let reduce_compiler = self.scoped_compiler(&[accumulator, variable], &mut scoped_ctx);
+        reduce_compiler.compile(reduce_expr, &inner_schema)
     }
 
     fn compile_quantifier(
@@ -1879,7 +2091,44 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         // evaluating the comprehension as a correlated subquery, mirroring what
         // the `Expr::Exists` arm above already does when `compile_pattern_exists`
         // cannot vectorize a pattern predicate.
+        // A node after the anchor that is already bound outside must be that
+        // very node. The vectorized operator would treat it as a fresh binding,
+        // so rename it and test identity instead: `(a)-->(b)` with `b` bound
+        // becomes `(a)-->(__pc_bound_0) WHERE id(__pc_bound_0) = id(b)`.
+        let (rebound, bound_preds) = rebind_bound_later_nodes(pattern, input_schema);
+        let pattern = &rebound;
+        let where_owned = bound_preds
+            .into_iter()
+            .chain(where_clause.cloned())
+            .reduce(|l, r| Expr::BinaryOp {
+                left: Box::new(l),
+                op: BinaryOp::And,
+                right: Box::new(r),
+            });
+        let where_clause = where_owned.as_ref();
+
         let (anchor_col, steps) = match analyze_pattern(pattern, input_schema, uni_schema) {
+            Ok(_)
+                if let Some(reason) =
+                    fast_path_unsupported(pattern, input_schema, FastPath::Comprehension) =>
+            {
+                // A bound node is in scope, but the pattern uses something the
+                // vectorized operator would ignore. The correlated subquery
+                // honours the whole pattern.
+                log::debug!("Pattern comprehension not vectorizable ({reason}); using a subquery");
+                let mut pattern = pattern.clone();
+                if let Some(first) = pattern.paths.first_mut()
+                    && path_variable.is_some()
+                {
+                    first.variable = path_variable.clone();
+                }
+                return self.compile_pattern_comprehension_as_subquery(
+                    &pattern,
+                    where_clause,
+                    map_expr,
+                    input_schema,
+                );
+            }
             Ok(analysis) => analysis,
             Err(e) => {
                 log::debug!(
@@ -2124,6 +2373,49 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             }
         }
 
+        // A branch that is a Cypher value makes the result one: every other
+        // non-null branch is converted to match (lists were, above). And a
+        // branch typed `Null` — a literal `null` — takes the other branches'
+        // type. Otherwise `CASE WHEN … THEN null ELSE reduce(…) END` failed
+        // at run time ("arguments need to have the same data type").
+        let branch_type = |e: &Arc<dyn PhysicalExpr>| e.data_type(input_schema).ok();
+        let branches: Vec<Option<DataType>> = when_then_phy
+            .iter()
+            .map(|(_, t)| branch_type(t))
+            .chain(else_phy.iter().map(branch_type))
+            .collect();
+        let target = if branches.contains(&Some(DataType::LargeBinary)) {
+            Some(DataType::LargeBinary)
+        } else {
+            // One type among the non-null branches: cast the `Null` ones to it.
+            // Several: leave them (numeric mixes are not unified here).
+            let mut typed = branches.iter().flatten().filter(|t| **t != DataType::Null);
+            match typed.next() {
+                Some(first) if typed.all(|t| t == first) => Some(first.clone()),
+                _ => None,
+            }
+        };
+        if let Some(target) = target {
+            let unify = |e: Arc<dyn PhysicalExpr>| -> Result<Arc<dyn PhysicalExpr>> {
+                Ok(match e.data_type(input_schema)? {
+                    t if t == target => e,
+                    DataType::Null => datafusion::physical_expr::expressions::cast(
+                        e,
+                        input_schema,
+                        target.clone(),
+                    )?,
+                    _ if target == DataType::LargeBinary => as_cypher_value(e, input_schema)?,
+                    _ => e,
+                })
+            };
+            for (_, t_phy) in &mut when_then_phy {
+                *t_phy = unify(t_phy.clone())?;
+            }
+            if let Some(e_phy) = else_phy.take() {
+                else_phy = Some(unify(e_phy)?);
+            }
+        }
+
         let case_expr = datafusion::physical_expr::expressions::CaseExpr::try_new(
             operand_phy,
             when_then_phy,
@@ -2213,6 +2505,24 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         let has_cv =
             is_cypher_value_type(left_type.as_ref()) || is_cypher_value_type(right_type.as_ref());
 
+        // A dynamically typed operand of AND/OR is read as a boolean, as under
+        // NOT; DataFusion's logical operators take only booleans, so
+        // `n.b AND true` over a schemaless property failed to plan.
+        if matches!(df_op, Operator::And | Operator::Or) && has_cv {
+            let left = if is_cypher_value_type(left_type.as_ref()) {
+                self.wrap_with_cv_to_bool(left)?
+            } else {
+                left
+            };
+            let right = if is_cypher_value_type(right_type.as_ref()) {
+                self.wrap_with_cv_to_bool(right)?
+            } else {
+                right
+            };
+            return binary(left, df_op, right, input_schema)
+                .map_err(|e| anyhow!("Failed to create binary expression: {}", e));
+        }
+
         if has_cv {
             if let Some(result) = self.compile_cv_comparison(
                 df_op,
@@ -2243,7 +2553,38 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             }
         }
 
-        // Use DataFusion's binary physical expression creator which handles coercion
+        // The physical `binary` does not coerce its operands; the logical path
+        // does, but an operand holding a comprehension, `reduce` or other custom
+        // expression is compiled here instead, so `size([x IN xs | x]) * 1.5`
+        // failed at run time ("Invalid arithmetic operation: Int64 * Float64"),
+        // as did the comparison `> 1.5`. Cast to the types DataFusion's own
+        // coercion picks.
+        if let (Some(l), Some(r)) = (&left_type, &right_type)
+            && crate::query::df_expr::is_map_vs_other(l, r)
+            && let Some(answer) =
+                incomparable_map_comparison(df_op, left.clone(), right.clone(), input_schema)?
+        {
+            return Ok(answer);
+        }
+
+        let (left, right) = match (&left_type, &right_type) {
+            (Some(l), Some(r)) if l != r => {
+                match datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer::new(
+                    l, &df_op, r,
+                )
+                .get_input_types()
+                {
+                    Ok((lt, rt)) => (
+                        datafusion::physical_expr::expressions::cast(left, input_schema, lt)?,
+                        datafusion::physical_expr::expressions::cast(right, input_schema, rt)?,
+                    ),
+                    Err(_) => (left, right),
+                }
+            }
+            _ => (left, right),
+        };
+
+        // Use DataFusion's binary physical expression creator
         binary(left, df_op, right, input_schema)
             .map_err(|e| anyhow!("Failed to create binary expression: {}", e))
     }
@@ -3015,6 +3356,7 @@ impl PhysicalExpr for ExistsExecExpr {
         // 7.3: Rewrite correlated property accesses to parameter references.
         // e.g., `n.prop` where `n` is an outer entity → `$param("n.prop")`
         let rewritten_query = rewrite_query_correlated(&self.query, &entity_vars);
+        let labelled_outer = outer_nodes_with_labels(&self.query, &entity_vars);
 
         // 7.4: Plan ONCE — the rewritten query is parameterized, same for all rows.
         let planner = QueryPlanner::new(self.uni_schema.clone());
@@ -3026,6 +3368,16 @@ impl PhysicalExpr for ExistsExecExpr {
                     e
                 )));
             }
+        };
+        // `EXISTS` only asks whether a row exists, so a variable-length
+        // relationship inside it may be searched for reachability rather than
+        // enumerated path by path. `COUNT {}` and `COLLECT {}` see every row.
+        let logical_plan = if self.mode == SubqueryResult::Exists {
+            crate::query::planner::LogicalPlan::MultiplicityInsensitive {
+                input: Box::new(logical_plan),
+            }
+        } else {
+            logical_plan
         };
 
         // Execute all rows on a dedicated thread with a single tokio runtime.
@@ -3074,6 +3426,7 @@ impl PhysicalExpr for ExistsExecExpr {
                             sub_params.insert(var.clone(), vid_val);
                         }
                     }
+                    supply_outer_labels(&mut sub_params, &labelled_outer, &graph_ctx);
 
                     let (batches, _plan) = rt.block_on(execute_subplan_with_outer_vars(
                         &logical_plan,
@@ -3504,19 +3857,22 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                 vars_in_scope.insert(name.clone());
             }
         }
-        // A pattern variable shadows an outer column of the same name.
+        // A pattern variable shadows an outer *value* of the same name. An
+        // outer node or relationship of that name is not shadowed: in openCypher
+        // a variable already bound in scope refers to the same entity inside the
+        // pattern, so it stays correlated.
         for v in &self.pattern_vars {
-            vars_in_scope.remove(v);
+            if !entity_vars.contains(v) {
+                vars_in_scope.remove(v);
+            }
         }
         let vars_in_scope: Vec<String> = vars_in_scope.into_iter().collect();
 
         // Only genuine entity variables drive the property-access rewrite; a
         // shadowed name must not be rewritten to an outer parameter either.
-        let correlated_vars: HashSet<String> = entity_vars
-            .difference(&self.pattern_vars)
-            .cloned()
-            .collect();
+        let correlated_vars: HashSet<String> = entity_vars.clone();
         let rewritten_query = rewrite_query_correlated(&self.query, &correlated_vars);
+        let labelled_outer = outer_nodes_with_labels(&self.query, &correlated_vars);
 
         // Planned once; the rewrite turned correlated references into parameters,
         // so the plan is the same for every row.
@@ -3588,6 +3944,7 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                             sub_params.insert(var.clone(), vid_val);
                         }
                     }
+                    supply_outer_labels(&mut sub_params, &labelled_outer, &graph_ctx);
 
                     // Counted here rather than once per `evaluate`: the cost
                     // this path carries is one sub-plan execution per outer
@@ -3807,18 +4164,285 @@ fn rewrite_query_correlated(query: &Query, outer_vars: &HashSet<String>) -> Quer
     }
 }
 
+/// Which vectorized operator a pattern is being considered for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FastPath {
+    /// `PatternExistsExecExpr`, for a pattern predicate.
+    Exists,
+    /// The vectorized pattern comprehension.
+    Comprehension,
+}
+
+/// Renames every node after a pattern's first element whose variable is bound
+/// in `input_schema`, returning the rewritten pattern and one
+/// `id(<new>) = id(<bound>)` predicate per rename.
+fn rebind_bound_later_nodes(
+    pattern: &uni_cypher::ast::Pattern,
+    input_schema: &Schema,
+) -> (uni_cypher::ast::Pattern, Vec<Expr>) {
+    use uni_cypher::ast::PatternElement;
+    let bound = |v: &str| {
+        input_schema
+            .column_with_name(&format!("{v}._vid"))
+            .is_some()
+            || input_schema.column_with_name(v).is_some()
+    };
+    let id_of = |v: &str| Expr::FunctionCall {
+        name: "id".to_string(),
+        args: vec![Expr::Variable(v.to_string())],
+        distinct: false,
+        window_spec: None,
+    };
+    let mut pattern = pattern.clone();
+    let mut preds = Vec::new();
+    for path in &mut pattern.paths {
+        for elem in path.elements.iter_mut().skip(1) {
+            if let PatternElement::Node(node) = elem
+                && let Some(var) = node.variable.clone().filter(|v| bound(v))
+            {
+                let fresh = format!("__pc_bound_{}", preds.len());
+                preds.push(Expr::BinaryOp {
+                    left: Box::new(id_of(&fresh)),
+                    op: BinaryOp::Eq,
+                    right: Box::new(id_of(&var)),
+                });
+                node.variable = Some(fresh);
+            }
+        }
+    }
+    (pattern, preds)
+}
+
+/// Why `pattern` cannot use the vectorized operator, or `None` if it can.
+///
+/// Both operators walk adjacency from a bound anchor and honour only part of
+/// a pattern; anything else they used to drop silently — the anchor's labels,
+/// relationship property maps, relationship uniqueness across hops, and for a
+/// comprehension also target property maps and variable-length ranges. This
+/// admits a pattern only when every feature it uses is one the operator
+/// implements, so everything else takes the general subquery path.
+fn fast_path_unsupported(
+    pattern: &uni_cypher::ast::Pattern,
+    input_schema: &Schema,
+    path: FastPath,
+) -> Option<&'static str> {
+    use uni_cypher::ast::{LabelExpr, PatternElement};
+    let bound = |v: &str| {
+        input_schema
+            .column_with_name(&format!("{v}._vid"))
+            .is_some()
+            || input_schema.column_with_name(v).is_some()
+    };
+    let [only] = pattern.paths.as_slice() else {
+        return Some("more than one path");
+    };
+    if only.shortest_path_mode.is_some() {
+        return Some("shortest path");
+    }
+    let mut elements = only.elements.iter();
+    match elements.next() {
+        Some(PatternElement::Node(anchor)) if anchor.variable.as_deref().is_some_and(bound) => {
+            if !matches!(anchor.labels, LabelExpr::Empty)
+                || anchor.properties.is_some()
+                || anchor.where_clause.is_some()
+            {
+                return Some("constraint on the anchor node");
+            }
+        }
+        _ => return Some("the first element is not a bound node"),
+    }
+    let mut rel_types: Vec<&[String]> = Vec::new();
+    for elem in elements {
+        match elem {
+            PatternElement::Relationship(r) => {
+                if r.range.is_some() {
+                    return Some("variable-length relationship");
+                }
+                if r.properties.is_some() || r.where_clause.is_some() {
+                    return Some("relationship property constraint");
+                }
+                if r.variable.as_deref().is_some_and(bound) {
+                    return Some("bound relationship variable");
+                }
+                rel_types.push(r.types.names());
+            }
+            PatternElement::Node(n) => {
+                if n.where_clause.is_some() {
+                    return Some("node inline WHERE");
+                }
+                match &n.labels {
+                    LabelExpr::Empty => {}
+                    LabelExpr::Conjunction(names) if names.len() == 1 => {}
+                    _ => return Some("more than one label on a node"),
+                }
+                if path == FastPath::Comprehension {
+                    if n.properties.is_some() {
+                        return Some("node property map in a comprehension");
+                    }
+                    if n.variable.as_deref().is_some_and(bound) {
+                        return Some("bound node after the anchor");
+                    }
+                }
+            }
+            PatternElement::Parenthesized { .. } => return Some("quantified sub-pattern"),
+        }
+    }
+    // Relationship uniqueness: the operators keep no per-path edge set, so two
+    // hops that could match the same relationship must not share a type.
+    for (i, a) in rel_types.iter().enumerate() {
+        for b in &rel_types[i + 1..] {
+            if a.is_empty() || b.is_empty() || a.iter().any(|t| b.contains(t)) {
+                return Some("two hops could match the same relationship");
+            }
+        }
+    }
+    None
+}
+
+/// Parameter holding an outer node's labels inside a correlated subquery.
+fn outer_labels_param(var: &str) -> String {
+    format!("{var}._labels")
+}
+
+/// Moves the labels of outer-bound nodes out of a subquery pattern and into
+/// predicates over `$<var>._labels`.
+///
+/// Inside the subquery an outer node exists only as parameters, not as scan
+/// columns, so the label filter the planner emits for `(n:Person)` —
+/// `array_has(n._labels, ...)` — referred to a column that is never there and
+/// failed with `No field named "n._labels"`. The predicate reads the same
+/// labels from a parameter [`ExistsExecExpr`] supplies instead.
+fn lift_outer_node_labels(
+    pattern: &uni_cypher::ast::Pattern,
+    outer_vars: &HashSet<String>,
+) -> (uni_cypher::ast::Pattern, Vec<Expr>) {
+    use uni_cypher::ast::{LabelExpr, PatternElement};
+    let mut pattern = pattern.clone();
+    let mut preds = Vec::new();
+    for path in &mut pattern.paths {
+        for elem in &mut path.elements {
+            let PatternElement::Node(node) = elem else {
+                continue;
+            };
+            let Some(var) = node.variable.as_ref().filter(|v| outer_vars.contains(*v)) else {
+                continue;
+            };
+            let has = |label: &String| Expr::In {
+                expr: Box::new(Expr::Literal(CypherLiteral::String(label.clone()))),
+                list: Box::new(Expr::Parameter(outer_labels_param(var))),
+            };
+            let combine = |op: BinaryOp, names: &[String]| {
+                names.iter().map(has).reduce(|l, r| Expr::BinaryOp {
+                    left: Box::new(l),
+                    op,
+                    right: Box::new(r),
+                })
+            };
+            let pred = match &node.labels {
+                LabelExpr::Empty => None,
+                LabelExpr::Conjunction(names) => combine(BinaryOp::And, names),
+                LabelExpr::Disjunction(names) => combine(BinaryOp::Or, names),
+            };
+            if let Some(pred) = pred {
+                preds.push(pred);
+                node.labels = LabelExpr::Empty;
+            }
+        }
+    }
+    (pattern, preds)
+}
+
+/// Adds `$<var>._labels` for each of `vars` the outer row does not already
+/// carry, resolved from the node's id. See [`lift_outer_node_labels`].
+fn supply_outer_labels(
+    sub_params: &mut HashMap<String, Value>,
+    vars: &HashSet<String>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+) {
+    for var in vars {
+        let key = outer_labels_param(var);
+        if sub_params.contains_key(&key) {
+            continue;
+        }
+        let labels = match sub_params.get(&format!("{var}._vid")) {
+            Some(Value::Int(raw)) => graph_ctx
+                .resolve_vertex_labels(
+                    uni_common::core::id::Vid::from(*raw as u64),
+                    &graph_ctx.query_context(),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+            // A NULL outer node has no labels, so a label test on it is false,
+            // as `(n:Label)` over NULL matches nothing.
+            _ => Vec::new(),
+        };
+        sub_params.insert(key, Value::List(labels));
+    }
+}
+
+/// Outer variables whose labels a correlated subquery tests (see
+/// [`lift_outer_node_labels`]), so their labels must be supplied per row.
+fn outer_nodes_with_labels(query: &Query, outer_vars: &HashSet<String>) -> HashSet<String> {
+    use uni_cypher::ast::{LabelExpr, PatternElement};
+    let mut out = HashSet::new();
+    let mut visit = |stmt: &Statement| {
+        for clause in &stmt.clauses {
+            if let Clause::Match(m) = clause {
+                for path in &m.pattern.paths {
+                    for elem in &path.elements {
+                        if let PatternElement::Node(node) = elem
+                            && let Some(var) = &node.variable
+                            && outer_vars.contains(var)
+                            && !matches!(node.labels, LabelExpr::Empty)
+                        {
+                            out.insert(var.clone());
+                        }
+                    }
+                }
+            }
+        }
+    };
+    fn walk(q: &Query, visit: &mut dyn FnMut(&Statement)) {
+        match q {
+            Query::Single(stmt) => visit(stmt),
+            Query::Union { left, right, .. } => {
+                walk(left, visit);
+                walk(right, visit);
+            }
+            _ => {}
+        }
+    }
+    walk(query, &mut visit);
+    out
+}
+
 /// Rewrite expressions within a clause for correlated property access.
 fn rewrite_clause_correlated(clause: &Clause, outer_vars: &HashSet<String>) -> Clause {
     match clause {
-        Clause::Match(m) => Clause::Match(MatchClause {
-            optional: m.optional,
-            pattern: m.pattern.clone(),
-            where_clause: m
+        Clause::Match(m) => {
+            let (pattern, label_preds) = lift_outer_node_labels(&m.pattern, outer_vars);
+            let where_clause = m
                 .where_clause
                 .as_ref()
-                .map(|e| rewrite_expr_correlated(e, outer_vars)),
-            for_update: m.for_update,
-        }),
+                .map(|e| rewrite_expr_correlated(e, outer_vars));
+            let where_clause =
+                label_preds
+                    .into_iter()
+                    .chain(where_clause)
+                    .reduce(|l, r| Expr::BinaryOp {
+                        left: Box::new(l),
+                        op: BinaryOp::And,
+                        right: Box::new(r),
+                    });
+            Clause::Match(MatchClause {
+                optional: m.optional,
+                pattern,
+                where_clause,
+                for_update: m.for_update,
+            })
+        }
         Clause::With(w) => Clause::With(WithClause {
             distinct: w.distinct,
             items: w
@@ -3966,6 +4590,42 @@ fn resolve_metric_for_property(
         }
     }
     None
+}
+
+/// A comparison of a map against another concrete type, answered without
+/// comparing (see `df_expr::is_map_vs_other`): NULL for an ordering operator,
+/// and for `=` / `<>` false / true unless a side is NULL. `None` for any other
+/// operator.
+fn incomparable_map_comparison(
+    op: datafusion::logical_expr::Operator,
+    left: Arc<dyn PhysicalExpr>,
+    right: Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{CaseExpr, IsNullExpr, Literal};
+    let null: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(None)));
+    match op {
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => Ok(Some(null)),
+        Operator::Eq | Operator::NotEq => {
+            let either_null = binary(
+                Arc::new(IsNullExpr::new(left)),
+                Operator::Or,
+                Arc::new(IsNullExpr::new(right)),
+                schema,
+            )?;
+            let answer: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(Some(
+                op == Operator::NotEq,
+            ))));
+            Ok(Some(Arc::new(CaseExpr::try_new(
+                None,
+                vec![(either_null, null)],
+                Some(answer),
+            )?)))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]

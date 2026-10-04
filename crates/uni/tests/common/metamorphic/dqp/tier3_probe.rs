@@ -46,6 +46,9 @@ fn candidates() -> Vec<(&'static str, fn(&mut UniConfig))> {
         ("batch_size=64", |c| c.batch_size = 64),
         ("batch_size=8192", |c| c.batch_size = 8192),
         ("parallelism=1", |c| c.parallelism = 1),
+        ("execution_batch_size=64", |c| {
+            c.execution_batch_size = Some(64)
+        }),
         ("partial_lance_writes", |c| {
             c.partial_lance_writes = !c.partial_lance_writes
         }),
@@ -133,16 +136,27 @@ async fn probe_which_tier3_knobs_are_observable() -> anyhow::Result<()> {
         inert.len()
     );
 
-    // **Tripwire, not a gate.** Measured 2026-08-13: all six knobs are inert,
-    // which is why Tier-3 levers are deferred rather than shipped.
+    // **Tripwire, not a gate.** Measured 2026-08-13: all six original knobs
+    // were inert, which is why Tier-3 levers were deferred.
     //
-    // If this fails, that is **good news**: a knob became observable, so a
-    // Tier-3 lever over it would now have a real activation witness and could
-    // ship. Move it into a lever with `activated` written against the counter
-    // named below, and drop it from `candidates`.
-    assert!(
-        observable.is_empty(),
-        "a Tier-3 knob is now observable, which unblocks a lever over it: {}",
+    // Measured 2026-09-28: `execution_batch_size` — added when
+    // `UniConfig::parallelism` and the engine batch size were wired through to
+    // DataFusion, where neither had reached before — is observable: a 64-row
+    // engine batch walks a flushed label in more ranges, so `storage_reads`
+    // and `rows_scanned` move (1040 -> 1640 on the tiny fixture). `parallelism`
+    // is wired too but moves no counter here: graph scans are single-partition
+    // operators, and `target_partitions` only reshapes DataFusion's own
+    // operators, which these counters do not see.
+    //
+    // If this fails, the set of observable knobs changed. A newly observable
+    // knob can carry a lever with `activated` written against the counter
+    // named below; a knob that stopped being observable means a lever over it
+    // would now be vacuous.
+    let observable_labels: Vec<&str> = observable.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        observable_labels,
+        vec!["execution_batch_size=64"],
+        "the observable Tier-3 knobs changed: {}",
         observable
             .iter()
             .map(|(k, m)| format!("{k} moved {m}"))

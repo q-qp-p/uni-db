@@ -81,6 +81,10 @@ pub struct PatternComprehensionExecExpr {
     needed_vertex_props: HashMap<String, Vec<String>>,
     /// Edge properties needed per variable: variable → [prop_names].
     needed_edge_props: HashMap<String, Vec<String>>,
+    /// The anchor column and the outer columns the map and predicate read,
+    /// exposed as children so a projection above keeps them (see
+    /// `common::outer_column_refs`).
+    outer_refs: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl Clone for PatternComprehensionExecExpr {
@@ -97,6 +101,7 @@ impl Clone for PatternComprehensionExecExpr {
             output_item_type: self.output_item_type.clone(),
             needed_vertex_props: self.needed_vertex_props.clone(),
             needed_edge_props: self.needed_edge_props.clone(),
+            outer_refs: self.outer_refs.clone(),
         }
     }
 }
@@ -116,6 +121,24 @@ impl PatternComprehensionExecExpr {
         needed_vertex_props: HashMap<String, Vec<String>>,
         needed_edge_props: HashMap<String, Vec<String>>,
     ) -> Self {
+        let mut hidden: Vec<&Arc<dyn PhysicalExpr>> = vec![&map_expr];
+        hidden.extend(predicate.iter());
+        let mut outer_refs = super::common::outer_column_refs(&hidden, &input_schema, &[]);
+        // The anchor is read by name — `evaluate` tries the exact name, then the
+        // bare variable — so the column it will read is a reference too.
+        // Exposing the bare variable while the exact one exists let a
+        // projection drop the exact one, which then read as NULL: no anchor, so
+        // an empty comprehension for every row.
+        let anchor_idx = input_schema.index_of(&anchor_column).ok().or_else(|| {
+            anchor_column
+                .strip_suffix("._vid")
+                .and_then(|var| input_schema.index_of(var).ok())
+        });
+        if let Some((idx, field)) = anchor_idx.map(|idx| (idx, input_schema.field(idx))) {
+            outer_refs.push(Arc::new(
+                datafusion::physical_expr::expressions::Column::new(field.name(), idx),
+            ));
+        }
         Self {
             graph_ctx,
             anchor_column,
@@ -128,6 +151,7 @@ impl PatternComprehensionExecExpr {
             output_item_type,
             needed_vertex_props,
             needed_edge_props,
+            outer_refs,
         }
     }
 }
@@ -188,6 +212,9 @@ impl PhysicalExpr for PatternComprehensionExecExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        // A projection above may have narrowed and renumbered the batch; the
+        // map and predicate read it by their compiled layout.
+        let batch = &super::common::realign_by_name(batch, &self.input_schema)?;
         let num_rows = batch.num_rows();
 
         // Step 1: Extract anchor VIDs
@@ -479,20 +506,23 @@ impl PhysicalExpr for PatternComprehensionExecExpr {
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         // map_expr and predicate are compiled against inner schema;
-        // don't expose to DF tree traversal.
-        vec![]
+        // don't expose to DF tree traversal. The outer columns they and the
+        // anchor read are exposed, so they are not projected away.
+        self.outer_refs.iter().collect()
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> DFResult<Arc<dyn PhysicalExpr>> {
-        if !children.is_empty() {
+        if children.len() != self.outer_refs.len() {
             return Err(DataFusionError::Internal(
-                "PatternComprehension has no children".to_string(),
+                "PatternComprehension's children are its outer column references".to_string(),
             ));
         }
-        Ok(self)
+        let mut new = (*self).clone();
+        new.outer_refs = children;
+        Ok(Arc::new(new))
     }
 
     fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

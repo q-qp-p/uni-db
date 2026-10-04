@@ -64,6 +64,9 @@ pub struct QuantifierExecExpr {
     input_schema: Arc<Schema>,
     /// Which quantifier to apply.
     quantifier_type: QuantifierType,
+    /// Outer columns `predicate` reads, exposed as children so a projection
+    /// above keeps them (see `common::outer_column_refs`).
+    outer_refs: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl Clone for QuantifierExecExpr {
@@ -74,6 +77,7 @@ impl Clone for QuantifierExecExpr {
             variable_name: self.variable_name.clone(),
             input_schema: self.input_schema.clone(),
             quantifier_type: self.quantifier_type,
+            outer_refs: self.outer_refs.clone(),
         }
     }
 }
@@ -95,12 +99,15 @@ impl QuantifierExecExpr {
         input_schema: Arc<Schema>,
         quantifier_type: QuantifierType,
     ) -> Self {
+        let outer_refs =
+            super::common::outer_column_refs(&[&predicate], &input_schema, &[&variable_name]);
         Self {
             input_list,
             predicate,
             variable_name,
             input_schema,
             quantifier_type,
+            outer_refs,
         }
     }
 }
@@ -158,6 +165,9 @@ impl PhysicalExpr for QuantifierExecExpr {
         // --- Step 1: Evaluate input list ---
         let list_val = self.input_list.evaluate(batch)?;
         let list_array = list_val.into_array(num_rows)?;
+        // The list is a child, renumbered for this batch by any projection
+        // above; the predicate reads the input by its compiled layout.
+        let batch = &super::common::realign_by_name(batch, &self.input_schema)?;
 
         // --- Step 2: CypherValue decode (LargeBinary → LargeList<LargeBinary>) ---
         // Keep elements as CypherValue (LargeBinary) to match the compile-time schema.
@@ -296,17 +306,20 @@ impl PhysicalExpr for QuantifierExecExpr {
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         // Only expose input_list. The predicate is compiled against the inner schema
-        // (with the loop variable) and must not be exposed to DF tree traversal.
-        vec![&self.input_list]
+        // (with the loop variable) and must not be exposed to DF tree traversal;
+        // the outer columns it reads are, so they are not projected away.
+        let mut children = vec![&self.input_list];
+        children.extend(self.outer_refs.iter());
+        children
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        if children.len() != 1 {
+        if children.len() != 1 + self.outer_refs.len() {
             return Err(datafusion::error::DataFusionError::Internal(
-                "QuantifierExecExpr requires exactly 1 child (input_list)".to_string(),
+                "QuantifierExecExpr requires its input_list and outer column children".to_string(),
             ));
         }
 
@@ -316,6 +329,7 @@ impl PhysicalExpr for QuantifierExecExpr {
             variable_name: self.variable_name.clone(),
             input_schema: self.input_schema.clone(),
             quantifier_type: self.quantifier_type,
+            outer_refs: children[1..].to_vec(),
         }))
     }
 

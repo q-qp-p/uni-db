@@ -26,7 +26,7 @@ use super::locy_delta::{
     RowRelation, RowStore, extract_cypher_conditions, extract_key, multiply_prob_factors_rows,
     resolve_clause_with_is_refs,
 };
-use super::locy_eval::{eval_expr, literal_to_value, record_batches_to_locy_rows};
+use super::locy_eval::{eval_expr, literal_to_value, record_batches_to_locy_rows, values_equal};
 use super::locy_traits::DerivedFactSource;
 
 /// Status of a tabling cache entry.
@@ -261,7 +261,7 @@ impl<'a> SLGResolver<'a> {
                 // Simple clause: inject goal constraints into WHERE
                 let cypher_conditions = extract_cypher_conditions(&clause.where_conditions);
                 let mut all_conditions = cypher_conditions;
-                inject_goal_where(&mut all_conditions, goal_bindings);
+                inject_goal_where(&mut all_conditions, goal_bindings, clause);
 
                 let raw_batches = self
                     .fact_source
@@ -273,9 +273,14 @@ impl<'a> SLGResolver<'a> {
                 // Explode any generator predicates (1:N) before projection.
                 let raw_rows = apply_generators(raw_rows, clause)?;
 
-                // Apply YIELD projections to compute non-key columns.
+                // Apply YIELD projections to compute non-key columns, then
+                // check the bindings the body could not take.
                 let projected = apply_yield_projections(raw_rows, clause)?;
-                all_answers.extend(projected);
+                all_answers.extend(
+                    projected
+                        .into_iter()
+                        .filter(|row| matches_goal(row, goal_bindings)),
+                );
             }
         }
 
@@ -584,15 +589,42 @@ fn make_cache_key(rule_name: &str, goal_bindings: &HashMap<String, Value>) -> Ca
 }
 
 /// Check if a row matches goal bindings.
+/// Whether a row satisfies every `key = literal` goal binding, by Locy's `=`.
+///
+/// This compared by structural `==`, so `k = 3.0` against an integer `k` (or a
+/// node in its other encoding) matched nothing and the query silently returned
+/// no rows. A NULL on either side is unknown, so it does not match.
 fn matches_goal(row: &FactRow, goal_bindings: &HashMap<String, Value>) -> bool {
-    goal_bindings
-        .iter()
-        .all(|(k, v)| row.get(k).map(|rv| rv == v).unwrap_or(false))
+    goal_bindings.iter().all(|(k, v)| {
+        row.get(k)
+            .is_some_and(|rv| !rv.is_null() && !v.is_null() && values_equal(rv, v))
+    })
 }
 
-/// Inject goal bindings as equality WHERE conditions.
-fn inject_goal_where(conditions: &mut Vec<Expr>, goal_bindings: &HashMap<String, Value>) {
+/// Inject goal bindings as equality WHERE conditions on the clause body.
+///
+/// Only a key yielded as a bare body variable (`YIELD KEY a`) names something
+/// the body binds. A key yielded under an alias (`YIELD KEY n.k AS k`) does not,
+/// and injecting `k = 3` made the body fail with "Variable 'k' not defined";
+/// such a binding is checked after projection instead.
+fn inject_goal_where(
+    conditions: &mut Vec<Expr>,
+    goal_bindings: &HashMap<String, Value>,
+    clause: &CompiledClause,
+) {
+    let RuleOutput::Yield(yc) = &clause.output else {
+        return;
+    };
+    let names = resolve_yield_column_names(&yc.items);
+    let body_variable = |var: &str| {
+        yc.items.iter().zip(&names).any(|(item, name)| {
+            item.is_key && name == var && matches!(&item.expr, Expr::Variable(v) if v == var)
+        })
+    };
     for (var, val) in goal_bindings {
+        if !body_variable(var) {
+            continue;
+        }
         conditions.push(Expr::BinaryOp {
             left: Box::new(Expr::Variable(var.clone())),
             op: BinaryOp::Eq,

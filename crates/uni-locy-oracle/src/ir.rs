@@ -5,10 +5,11 @@
 //! evaluation code. The [`generator`](crate::generator) emits this IR alongside
 //! the equivalent Locy program text from a single source of truth.
 //!
-//! The IR models only Locy's **monotone core**: a fact is a tuple of `i64`s
-//! (the seeded node `id`s), a relation is a set of such tuples, and a rule is a
-//! union of clauses, each a relational join over base tuples plus `IS` / `IS NOT`
-//! references to other relations.
+//! A fact is a tuple of `i64`s (seeded node `id`s and integer values). A plain
+//! rule's relation is a set of such tuples; a `FOLD` rule's is one row per
+//! group; an `ALONG` rule's is a bag, one row per derivation path; a `BEST BY`
+//! rule's is one row per key. A rule is a union of clauses, each a relational
+//! join over base tuples plus `IS` / `IS NOT` references to other relations.
 
 // Rust guideline compliant
 
@@ -36,6 +37,45 @@ pub struct IsRef {
     ///
     /// Always `None` for a negated reference.
     pub target: Option<String>,
+    /// Local variables bound to the referenced fact's remaining columns, in
+    /// order, after the subjects and the target: an `ALONG` value read as
+    /// `prev.q`, or a recursive `FOLD`'s folded value. Empty for a negated
+    /// reference.
+    pub values: Vec<String>,
+}
+
+/// A variable a clause computes after its references are joined:
+/// `constant + factor * sum of vars` — an `ALONG` step (`prev.q + e.w`), a fold
+/// input (`s + e.w`), a constant seed (`1 AS s`), or a probability in
+/// [`PROB_SCALE`] units (`e.w / 10.0` is `factor = PROB_SCALE / 10`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Computed {
+    /// The variable bound.
+    pub name: String,
+    /// Variables summed.
+    pub vars: Vec<String>,
+    /// Multiplies the sum.
+    pub factor: i64,
+    /// Added to the product.
+    pub constant: i64,
+}
+
+/// A probability `p` is held as the integer `round(p * PROB_SCALE)`.
+pub const PROB_SCALE: i64 = 1_000_000_000;
+
+/// A probabilistic `IS NOT` (#PROB): when both the referenced rule and this
+/// one carry a PROB column, the reference is not an anti-join but a factor:
+/// the referenced facts matching the subjects are combined by noisy-OR into
+/// `q`, and the clause's probability column is multiplied by `1 - q` (by 1
+/// when none match).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbComplement {
+    /// The reference (`negated` form; no target).
+    pub reference: IsRef,
+    /// The referenced rule's PROB column.
+    pub prob_column: usize,
+    /// This clause's PROB variable, multiplied in place.
+    pub prob_var: String,
 }
 
 /// One clause (a single `CREATE RULE ... AS` definition) in relational-skeleton form.
@@ -56,6 +96,10 @@ pub struct OracleClause {
     pub neg_refs: Vec<IsRef>,
     /// Local variables projected to the `YIELD KEY` columns, in output order.
     pub yield_vars: Vec<String>,
+    /// Variables computed after the references, in order.
+    pub computed: Vec<Computed>,
+    /// Probabilistic `IS NOT` references, applied after `computed`.
+    pub prob_complements: Vec<ProbComplement>,
 }
 
 /// A rule: a named relation defined as the union of its [`clauses`](OracleRule::clauses).
@@ -65,6 +109,72 @@ pub struct OracleRule {
     pub name: String,
     /// Clauses whose results are unioned into this relation.
     pub clauses: Vec<OracleClause>,
+    /// A `FOLD` over the rule's rows, when the rule aggregates. A clause may
+    /// reference the rule itself: it then reads the **folded** relation (one
+    /// row per key, from the previous iteration), and the rule is recomputed
+    /// until no folded value moves.
+    pub fold: Option<OracleFold>,
+    /// The rule's facts are one row per derivation path (an `ALONG` rule,
+    /// #159): a **bag**, recomputed from scratch each iteration, in which two
+    /// paths with equal values are two facts. Terminates only on acyclic input.
+    pub per_path: bool,
+    /// `BEST BY`: one row per key, the one with the best criterion.
+    pub best: Option<OracleBest>,
+}
+
+/// `BEST BY <column> ASC|DESC` over a rule's rows, grouped by its leading keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleBest {
+    /// Leading key columns of each row.
+    pub key_count: usize,
+    /// The criterion's column.
+    pub criterion: usize,
+    /// `ASC` keeps the least criterion, `DESC` the greatest.
+    pub ascending: bool,
+}
+
+/// A FOLD aggregate the oracle evaluates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agg {
+    /// `COUNT(*)`: rows in the group.
+    CountStar,
+    /// `COUNT(x)`: non-null inputs in the group (inputs are never null here).
+    Count,
+    /// `SUM(x)` / `MSUM(x)`.
+    Sum,
+    /// `MIN(x)` / `MMIN(x)`.
+    Min,
+    /// `MAX(x)` / `MMAX(x)`.
+    Max,
+    /// `MNOR(x)`: `1 - prod(1 - x)`, inputs and output in [`PROB_SCALE`] units.
+    NoisyOr,
+    /// `MPROD(x)`: `prod(x)`, inputs and output in [`PROB_SCALE`] units.
+    Product,
+}
+
+/// One aggregate of a [`OracleFold`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldAgg {
+    /// The aggregate.
+    pub agg: Agg,
+    /// Column of the clause's projected row holding the input; `None` for
+    /// [`Agg::CountStar`].
+    pub input: Option<usize>,
+}
+
+/// A `FOLD` over a rule's rows: `YIELD KEY k1..kn, agg1, agg2, ...`.
+///
+/// Each clause projects its `yield_vars` as the `key_count` key columns
+/// followed by the aggregates' input columns. Unlike a plain rule, which is a
+/// **set**, the fold reads the **bag** of those rows — every binding counts,
+/// so parallel edges contribute once each — grouped by the key columns. The
+/// fact for a group is its key followed by each aggregate's value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleFold {
+    /// Leading key columns of each projected row.
+    pub key_count: usize,
+    /// The aggregates, in output order.
+    pub aggs: Vec<FoldAgg>,
 }
 
 /// A stratified program: rules grouped into dependency-ordered strata.

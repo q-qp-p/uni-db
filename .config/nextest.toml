@@ -52,11 +52,27 @@ filter = 'test(instrumented_get_edges_scaling) or test(probe_get_edges_layer_att
 test-group = 'issue-55-get-edges'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# The DQP query-rewrite and wide-tier smokes (W3 of
+# docs/proposals/correctness_class_harness_2026-09-28.md). Alone they take about
+# 55 s (`topo_rewrites_flushed`, 60 cases), 30 s
+# (`topo_rewrites_unflushed_small_batches`, 15 cases at a two-row execution
+# batch) and 40 s (`flush_wide_smoke`, 100 cases); beside the rest of the suite
+# they measured 89 s, 151 s and 82 s — the two-row batch suffers most under
+# contention. 6 minutes leaves room without cutting cases further.
+[[profile.default.overrides]]
+filter = 'test(/metamorphic::dqp::topo::topo_rewrites/) or test(flush_wide_smoke)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 # CI profile: keep running after failures so one broken test surfaces the
 # full failure set in a single pipeline run. Select with `--profile ci`.
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Mirrored from the default profile; see the rationale there.
+[[profile.ci.overrides]]
+filter = 'test(/metamorphic::dqp::topo::topo_rewrites/) or test(flush_wide_smoke)'
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Mirrored explicitly rather than relying on override inheritance from
 # `default`; see the rationale on the default-profile override above.

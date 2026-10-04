@@ -22,7 +22,7 @@ use super::locy_delta::{
 };
 
 use super::locy_eval::{
-    eval_expr, normalize_graph_row, record_batches_to_locy_rows, values_equal_for_join,
+    eval_condition, normalize_graph_row, record_batches_to_locy_rows, values_equal_for_join,
 };
 use super::locy_slg::SLGResolver;
 use super::locy_traits::DerivedFactSource;
@@ -331,12 +331,12 @@ async fn explain_rule_mode_a(
     let matching_entries: Vec<_> = if let Some(where_expr) = &query.where_expr {
         tracker_entries
             .into_iter()
-            .filter(|(_, entry)| {
-                eval_expr(where_expr, &entry.fact_row)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
+            .map(|e| {
+                let keep = eval_condition(where_expr, &e.1.fact_row, "EXPLAIN RULE WHERE")?;
+                Ok(keep.then_some(e))
             })
-            .collect()
+            .filter_map(Result::transpose)
+            .collect::<Result<_, LocyError>>()?
     } else {
         tracker_entries
     };
@@ -467,12 +467,9 @@ async fn explain_rule_mode_b(
     let filtered: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
         facts
             .into_iter()
-            .filter(|row| {
-                eval_expr(where_expr, row)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            })
-            .collect()
+            .map(|row| Ok(eval_condition(where_expr, &row, "EXPLAIN RULE WHERE")?.then_some(row)))
+            .filter_map(Result::transpose)
+            .collect::<Result<_, LocyError>>()?
     } else {
         facts
     };

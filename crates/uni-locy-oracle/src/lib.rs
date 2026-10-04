@@ -18,10 +18,29 @@
 //!
 //! # Scope
 //!
-//! The oracle covers Locy's **monotone core** — plain rules, `IS` references,
-//! stratified `IS NOT`, and `YIELD`. Non-core constructs (`FOLD` non-`M`
-//! aggregates, `ALONG`, `BEST BY`, `DERIVE`, `ASSUME`, `PROB`, `HAVING`) are out
-//! of scope and the oracle panics rather than silently mis-handling them.
+//! The oracle covers plain rules, `IS` references, stratified `IS NOT` and
+//! `YIELD`, and evaluates every rule as a bag before finalizing it by its kind:
+//!
+//! * a plain rule is a **set**;
+//! * a `FOLD` rule aggregates the **bag** of its rows per key (`COUNT(*)`,
+//!   `COUNT`, `SUM`/`MSUM`, `MIN`/`MMIN`, `MAX`/`MMAX`, `MCOUNT`, `MNOR`,
+//!   `MPROD`), so parallel edges contribute once each; recursively, a
+//!   self-reference reads the children's **folded** values (#162);
+//! * an `ALONG` rule keeps **one fact per derivation path** (#159), equal
+//!   values included — two paths that diverge below the first hop are two
+//!   facts;
+//! * a `BEST BY` rule keeps the best row per key (shortest or longest path);
+//! * a PROB rule carries a probability (as a fixed-point integer), and an
+//!   `IS NOT` between two PROB rules multiplies by the complement of the
+//!   referenced facts' noisy-OR instead of anti-joining.
+//!
+//! Per-path and recursive-sum rules terminate only on acyclic input, so the
+//! generator gives them the edges to a greater id. `DERIVE`, `ASSUME`,
+//! `ABDUCE` and `HAVING` are out of scope.
+//!
+//! [`generator::random_program_strategy`] draws random programs over a random
+//! multigraph (self-loops, parallel and identical edges, two relationship
+//! types, integer weights) that exercise all of the above.
 
 // Rust guideline compliant
 pub mod eval;

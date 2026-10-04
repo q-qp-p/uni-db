@@ -35,6 +35,37 @@ pub enum LocyCompileError {
     #[error("REQUIRE in rule '{rule}' requires a FOLD clause")]
     RequireWithoutFold { rule: String },
 
+    /// A FOLD clause yields a column that is neither a KEY nor a FOLD output.
+    ///
+    /// A FOLD groups rows by the KEY columns and emits one row per group, so
+    /// such a column has no single value to carry and the runtime drops it.
+    /// Rejecting it here replaces a silently absent column, which a later
+    /// `QUERY ... RETURN` would read as NULL (issue #293).
+    #[error(
+        "YIELD column '{column}' in FOLD rule '{rule}' is neither a KEY nor a FOLD output. \
+         A FOLD emits one row per distinct KEY, so any other column would be dropped. \
+         `KEY` marks a single YIELD item: to group by several columns write \
+         `YIELD KEY a, KEY b, total`, not `YIELD KEY a, b, total`"
+    )]
+    UngroupedFoldYield { rule: String, column: String },
+
+    /// A QUERY references a variable its rule does not yield.
+    ///
+    /// The QUERY is evaluated over the rule's derived facts, so a variable
+    /// that is not one of its YIELD columns has no value in any row. It used
+    /// to evaluate to NULL, which made a dropped or misspelled column look
+    /// like missing data (issue #293).
+    #[error(
+        "QUERY {rule} references '{variable}', which rule '{rule}' does not yield; \
+         its columns are: {}",
+        available.join(", ")
+    )]
+    UnknownQueryVariable {
+        rule: String,
+        variable: String,
+        available: Vec<String>,
+    },
+
     #[error("wardedness violation: variable '{variable}' in rule '{rule}' not bound by MATCH")]
     WardednessViolation { rule: String, variable: String },
 

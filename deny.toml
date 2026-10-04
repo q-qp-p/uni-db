@@ -45,6 +45,17 @@ ignore = [
   { id = "RUSTSEC-2026-0182", reason = "wasmtime-wasi 43.0.2 pinned by extism 1.30.0. Leak in WASIp1 fd_renumber." },
   { id = "RUSTSEC-2026-0188", reason = "wasmtime-wasi 43.0.2 pinned by extism 1.30.0. Hard links/renames bypass the preopen sandbox." },
   { id = "RUSTSEC-2026-0269", reason = "wasmtime 43.0.2 pinned by extism 1.30.0. Trailing-slash path/symlink sandbox escape. Verified 2026-09-02: the advisory's patched ranges are >=24.0.13, >=36.0.14, >=46.0.3, >=47.0.4 -- 43 was never backported and crates.io has no 43.x above 43.0.2, so `cargo update -p wasmtime` cannot clear it. extism 1.30.0 is still the newest release." },
+  # Six more, published after 2026-09-16. Verified 2026-10-03: each advisory's
+  # patched ranges are 36.0.16+/36.0.17+ (36.x LTS), 48.0.3+/48.0.4+ and
+  # 49.0.1+/49.0.2+ -- 43 is not among them, and extism 1.30.0 (requires
+  # wasmtime "43") is still the newest release. uni-plugin-wasm stays on 43 with
+  # it (VERSION SYNC in its Cargo.toml: two majors would link two wasmtimes).
+  { id = "RUSTSEC-2026-0316", reason = "wasmtime 43.0.2 pinned by extism 1.30.0. Component-model dynamic record lifting can allocate beyond the hostcall fuel limit." },
+  { id = "RUSTSEC-2026-0327", reason = "wasmtime 43.0.2 pinned by extism 1.30.0. Async-lifted component callback result count unvalidated (native stack overflow). component-model-async IS enabled in the unified build (via wasmtime-wasi / extism), so this is reachable for an async-lifted guest export." },
+  { id = "RUSTSEC-2026-0314", reason = "wasmtime-wasi 43.0.2 pinned by extism 1.30.0. Guest can panic the host through a filesystem datetime overflow." },
+  { id = "RUSTSEC-2026-0321", reason = "wasmtime-wasi 43.0.2 pinned by extism 1.30.0. WASI preview 0 poll_oneoff circumvents fuel consumption." },
+  { id = "RUSTSEC-2026-0322", reason = "wasmtime-wasi 43.0.2 pinned by extism 1.30.0. Excessive host allocation when guests have no stdio." },
+  { id = "RUSTSEC-2026-0323", reason = "wasmtime-wasi 43.0.2 pinned by extism 1.30.0. fd_readdir copies uninitialized struct padding into guest memory." },
 
   # RUSTSEC-2025-0057 (fxhash, unmaintained) was here and is gone (#174).
   #

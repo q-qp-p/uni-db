@@ -191,8 +191,19 @@ rule_condition = {
     is_not_rule_reference
     | is_rule_reference
     | generator_reference
-    | expression
+    | expression ~ !(IS | "->")
+    | rule_and_condition
 }
+
+// A Cypher `expression` takes the `AND` that separates conditions as its own,
+// so in `x AND NOT a IS r TO b` it consumed `x AND NOT a` and stopped at `IS`,
+// and the clause failed to parse. When the full expression ends right before
+// `IS` or `->` (the start of a rule or generator reference), the condition is
+// instead the chain of `AND`ed terms up to that reference. An `OR` or `XOR`
+// before the reference still fails to parse: splitting there would regroup
+// `x OR y AND NOT a IS r` as `(x OR y) AND ...`.
+rule_and_condition = { not_expression ~ (AND ~ !rule_reference_start ~ not_expression)* }
+rule_reference_start = _{ is_not_rule_reference | is_rule_reference | generator_reference }
 
 // ── Generator predicate (1:N, binds new variables) ──────────────────────
 //

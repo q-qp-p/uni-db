@@ -742,7 +742,7 @@ fn build_rule_condition(pair: Pair<LocyRule>) -> Result<RuleCondition, ParseErro
         LocyRule::is_not_rule_reference => {
             Ok(RuleCondition::IsReference(build_is_reference(inner, true)?))
         }
-        LocyRule::expression => {
+        LocyRule::expression | LocyRule::rule_and_condition => {
             let expr = reparse_as_cypher_expression(inner.as_str())?;
             Ok(RuleCondition::Expression(expr))
         }

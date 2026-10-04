@@ -229,6 +229,22 @@ async fn an_optional_match_predicate_runs_the_optional_filter() -> Result<()> {
     Ok(())
 }
 
+/// Rows entering an OPTIONAL MATCH are tagged with an id, so the operators
+/// that null-fill unmatched or filtered-out rows group by entering row rather
+/// than by bound node id (see `df_graph::optional_source`). Without the tag a
+/// second entering row binding the same node lost its NULL row.
+#[tokio::test]
+async fn an_optional_match_tags_its_entering_rows() -> Result<()> {
+    let db = fixture().await?;
+    assert_plan_uses(
+        &db.session(),
+        "MATCH (a:Src) OPTIONAL MATCH (a)-[:R]->(b:Dst) RETURN a.k, b.k",
+        "OptionalSourceRowIdExec",
+    )
+    .await;
+    Ok(())
+}
+
 // ── Mutations ──────────────────────────────────────────────────────────────
 //
 // `MutationExec` reports one of five `display_name`s, and the registry gives
@@ -412,22 +428,17 @@ async fn a_call_subquery_runs_the_graph_apply() -> Result<()> {
 
 // ── Anchors ────────────────────────────────────────────────────────────────
 
-/// An unlabelled `ext_id` equality anchors through the external-id lookup.
+/// An unlabelled `ext_id` equality no longer uses the external-id lookup.
 ///
-/// The guard is easy to defeat by accident and invisible in the result: the
-/// pattern must carry **no label**, and the value must be a string *literal*.
-/// A labelled pattern over the same property plans an ordinary scan and returns
-/// the identical row — which is exactly the silent-downgrade shape this gate
-/// exists for, so the twin below is the load-bearing half of this test.
-///
-/// Both arms project `ext_id` rather than `k`: without a label there is no
-/// property schema to resolve against, and the unlabelled plan carries only
-/// `_vid`, `ext_id` and `_label`.
+/// That operator read flushed rows only and projected no properties, so it
+/// was retired: the pattern plans as a schemaless scan with the equality
+/// pushed down to the `ext_id` index. Correctness is pinned in
+/// `bugs::ext_id_lookup_sees_everything`; this pins the plan choice.
 #[tokio::test]
-async fn an_unlabelled_ext_id_match_runs_the_ext_id_lookup() -> Result<()> {
+async fn an_unlabelled_ext_id_match_scans_the_vertex_table() -> Result<()> {
     let db = fixture().await?;
     let session = db.session();
-    assert_plan_uses(
+    assert_plan_avoids(
         &session,
         "MATCH (n {ext_id: 'e1'}) RETURN n.ext_id",
         "GraphExtIdLookupExec",

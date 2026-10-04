@@ -286,7 +286,7 @@ Error: Query execution failed: Out of memory
    use uni_db::UniConfig;
 
    let mut config = UniConfig::default();
-   config.batch_size = 1024;  // Smaller batches
+   config.execution_batch_size = Some(1024);  // Smaller engine batches (default 8192)
    ```
 
 ---

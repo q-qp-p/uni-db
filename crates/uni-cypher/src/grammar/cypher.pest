@@ -300,8 +300,8 @@ comparison_tail = {
     // Special predicates
     | IS ~ NOT? ~ NULL
     | IS ~ UNIQUE
-    | IS ~ ":" ~ identifier_or_keyword                        // IS :Label
-    | ":" ~ identifier_or_keyword                             // Bare :Label
+    | IS ~ ":" ~ identifier_or_keyword ~ (pipe ~ ":"? ~ identifier_or_keyword)*  // IS :Label[|Label]
+    | ":" ~ identifier_or_keyword ~ (pipe ~ ":"? ~ identifier_or_keyword)*       // Bare :Label[|Label]
     | IN ~ additive_expression
     | CONTAINS ~ additive_expression
     | STARTS ~ WITH ~ additive_expression

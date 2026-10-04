@@ -429,11 +429,24 @@ pub struct UniConfig {
     /// Maximum adjacency cache size in bytes (default: 1GB)
     pub cache_size: usize,
 
-    /// Number of worker threads for parallel execution
+    /// Partitions the query engine plans with (DataFusion's
+    /// `target_partitions`). Defaults to the number of CPUs, which is also
+    /// DataFusion's own default.
     pub parallelism: usize,
 
-    /// Size of each data morsel/batch (number of rows)
+    /// Rows per page a query cursor hands back (default: 1024).
+    ///
+    /// This is the consumer-facing page size, not the query engine's internal
+    /// batch size; see [`Self::execution_batch_size`] for that.
     pub batch_size: usize,
+
+    /// Rows per batch inside the query engine (DataFusion's `batch_size`).
+    ///
+    /// `None` (the default) keeps DataFusion's default of 8192. Result-neutral:
+    /// changing it changes how work is chunked, never what a query returns,
+    /// which is what lets tests vary it to catch results that depend on batch
+    /// boundaries.
+    pub execution_batch_size: Option<usize>,
 
     /// Maximum size of traversal frontier before pruning
     pub max_frontier_size: usize,
@@ -727,7 +740,8 @@ impl Default for UniConfig {
         Self {
             cache_size: 1024 * 1024 * 1024, // 1GB
             parallelism,
-            batch_size: 1024, // Default morsel size
+            batch_size: 1024, // Default cursor page size
+            execution_batch_size: None,
             max_frontier_size: 1_000_000,
             auto_flush_threshold: 10_000,
             commit_channel_capacity: 256,

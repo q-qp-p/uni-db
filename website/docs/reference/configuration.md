@@ -48,11 +48,14 @@ pub struct UniConfig {
     /// Maximum adjacency cache size in bytes (default: 1GB)
     pub cache_size: usize,
 
-    /// Number of worker threads for parallel execution
+    /// Partitions per query plan (DataFusion `target_partitions`)
     pub parallelism: usize,
 
-    /// Size of each data morsel/batch (number of rows)
+    /// Rows per page a query cursor hands back (default: 1024)
     pub batch_size: usize,
+
+    /// Rows per batch inside the query engine (default: `None`, i.e. 8192)
+    pub execution_batch_size: Option<usize>,
 
     /// Maximum size of traversal frontier before pruning
     pub max_frontier_size: usize,
@@ -175,8 +178,9 @@ pub struct UniConfig {
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `cache_size` | bytes | 1 GB | Maximum adjacency cache size |
-| `parallelism` | count | CPU cores | Worker threads for parallel execution |
-| `batch_size` | rows | 1,024 | Rows per morsel/batch |
+| `parallelism` | count | CPU cores | Partitions per query plan (DataFusion `target_partitions`) |
+| `batch_size` | rows | 1,024 | Rows per page a query cursor hands back; does not affect execution |
+| `execution_batch_size` | rows | `None` (8,192) | Rows per batch inside the query engine. Never changes results; smaller values bound per-batch memory |
 | `max_frontier_size` | count | 1,000,000 | Maximum traversal frontier size |
 | `auto_flush_threshold` | count | 10,000 | Mutations triggering auto-flush |
 | `auto_flush_interval` | duration | 5s | Time-based flush interval (None to disable) |
@@ -728,7 +732,7 @@ let config = UniConfig {
     auto_flush_interval: None,  // Disable time-based flush during batch
     cache_size: 10 * 1024 * 1024 * 1024,  // 10 GB
     parallelism: num_cpus::get(),
-    batch_size: 8192,
+    execution_batch_size: Some(8192),
     ..Default::default()
 };
 ```
@@ -805,7 +809,7 @@ let config = UniConfig {
     auto_flush_threshold: 1_000,
     auto_flush_interval: Some(Duration::from_secs(2)),
     parallelism: 2,
-    batch_size: 1024,
+    execution_batch_size: Some(1024),  // Smaller engine batches
     max_query_memory: 256 * 1024 * 1024,  // 256 MB per query
     ..Default::default()
 };

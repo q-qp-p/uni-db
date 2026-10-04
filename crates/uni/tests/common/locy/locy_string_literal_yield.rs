@@ -195,52 +195,33 @@ async fn string_literal_yield_string_functions_reach_derived() -> Result<()> {
     Ok(())
 }
 
-/// Boundary: a plain value column alongside `FOLD` is **dropped entirely**, not
-/// returned as NULL.
+/// Boundary: a plain value column alongside `FOLD` is **rejected at compile
+/// time**, not returned as NULL.
 ///
-/// Measured, not assumed. `FoldExec` emits only the KEY and fold columns, so
-/// `g` never reaches the derived relation at all — the row is
-/// `{"p": Float(0.5), "a": Node(..)}` with no `g` key.
-///
-/// Pinned here to keep the two behaviours distinct. The `LargeUtf8` bug this
-/// file is about produced a *present column holding NULL*; this produces an
-/// *absent column*. If a future change turned this into `g = NULL`, it would
-/// look like a regression of the decode bug while actually being a different
-/// fault, and vice versa.
-///
-/// Whether silently dropping a yielded column is itself right is a separate
-/// question, deliberately not litigated here.
+/// `FoldExec` emits only the KEY and fold columns, so `g` used to vanish from
+/// the derived relation without a diagnostic — an *absent column*, distinct
+/// from the *present column holding NULL* that the `LargeUtf8` bug in this
+/// file produced. Issue #293 showed where that leads: `QUERY ... RETURN` read
+/// the absent column as NULL, so the program returned a plausible wrong
+/// answer. The compiler now refuses the program instead (see
+/// `locy_issue_293_fold_ungrouped_yield`), which keeps the two faults distinct
+/// in a stronger way: this one can no longer produce a row at all.
 #[tokio::test]
-async fn string_literal_yield_under_fold_drops_the_column_entirely() -> Result<()> {
+async fn string_literal_yield_under_fold_is_rejected() -> Result<()> {
     let db = setup(true).await?;
-    let session = db.session();
-    let tx = session.tx().await?;
-    tx.execute("CREATE (:N {name: 'B'})").await?;
-    tx.execute("MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R {prob: 0.5}]->(b)")
-        .await?;
-    tx.commit().await?;
-
     let program = "CREATE RULE t AS\n\
            MATCH (a:N)-[e:R]->(b:N)\n\
            FOLD p = MNOR(e.prob)\n\
            YIELD KEY a, 'grp' AS g, p";
-    let result = db.session().locy(program).await?;
-    let empty = vec![];
-    let row = result
-        .derived_facts("t")
-        .unwrap_or(&empty)
-        .first()
-        .expect("precondition: the FOLD rule must derive a fact")
-        .clone();
-
+    let err = db
+        .session()
+        .locy(program)
+        .await
+        .expect_err("a non-KEY, non-fold column under FOLD must be rejected");
     assert!(
-        !row.contains_key("g"),
-        "a non-KEY, non-fold column is dropped by FoldExec, not nulled; got {row:?}"
-    );
-    assert_eq!(
-        row.get("p"),
-        Some(&Value::Float(0.5)),
-        "the fold column itself must survive"
+        err.to_string().contains("'g'")
+            && err.to_string().contains("neither a KEY nor a FOLD output"),
+        "the error must name the ungrouped column: {err}"
     );
     Ok(())
 }

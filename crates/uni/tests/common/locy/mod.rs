@@ -38,6 +38,14 @@ pub mod value_assert;
 pub mod locy_issue_158_is_not_subject_scope;
 // Issue #159: aggregation inside a recursive rule dedups equal values.
 pub mod locy_issue_159_recursive_fold_dedup;
+// A seed clause alongside a COUNT fold: the seed is one counted row.
+pub mod locy_count_fold_seed;
+// Mutually recursive rules in one stratum keep their own facts.
+pub mod locy_mutual_recursion_per_rule_facts;
+// Issue #293: a FOLD silently dropped YIELD columns that were not KEY.
+pub mod locy_issue_293_fold_ungrouped_yield;
+// Issue #294: recursive FOLD collapsed parallel edges between one node pair.
+pub mod locy_issue_294_parallel_edge_fold;
 // Issue #160: QUERY (SLG) and derived (fixpoint) diverge when an IS-ref
 // introduces a variable binding the MATCH pattern does not provide.
 pub mod locy_issue_160_query_derived_parity;
@@ -66,3 +74,7 @@ pub mod locy_issue_272_is_ref_to_value_column;
 pub mod locy_issue_273_post_fold_param;
 // A negated IS-ref whose TO target lands on a scalar column excluded nothing.
 pub mod locy_is_not_scalar_to_target;
+// W4: a fact is a row; QUERY WHERE is three-valued; a sum of nothing is 0.
+pub mod locy_facts_and_filters;
+// W4: MIN/MAX/COLLECT and yielded properties keep their value types.
+pub mod locy_value_types;

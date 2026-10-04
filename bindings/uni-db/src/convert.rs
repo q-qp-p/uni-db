@@ -1597,6 +1597,7 @@ pub const UNI_CONFIG_KEYS: &[&str] = &[
     "cache_size",
     "max_transaction_memory",
     "batch_size",
+    "execution_batch_size",
     "wal_enabled",
     "strict_schema",
     "max_forks",
@@ -1668,6 +1669,9 @@ pub fn apply_uni_config(
     }
     if let Some(v) = config.get("batch_size") {
         uni_config.batch_size = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("execution_batch_size") {
+        uni_config.execution_batch_size = v.extract::<Option<usize>>(py)?;
     }
     if let Some(v) = config.get("wal_enabled") {
         uni_config.wal_enabled = v.extract::<bool>(py)?;
@@ -1893,6 +1897,7 @@ pub fn uni_config_to_py(py: Python, config: &uni_common::UniConfig) -> PyResult<
     dict.set_item("max_query_memory", config.max_query_memory)?;
     dict.set_item("max_transaction_memory", config.max_transaction_memory)?;
     dict.set_item("batch_size", config.batch_size)?;
+    dict.set_item("execution_batch_size", config.execution_batch_size)?;
     dict.set_item("auto_flush_threshold", config.auto_flush_threshold)?;
     dict.set_item(
         "auto_flush_interval",

@@ -962,13 +962,15 @@ async fn run_program(
                 exec.set_profile_collector(Arc::clone(c));
             }
             let task_ctx = session_ctx.read().task_ctx();
+            let per_rule_output = exec.per_rule_output();
             let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
             // #261. The derived store keeps every relation of every stratum to
             // completion; `max_derived_bytes` bounds the fixpoint's own facts
             // but this accumulation sits outside it, and `peak_memory_slot` only
             // reports the total afterwards.
             let mut reservation = operator_reservation("LocyProgramExec", 0, &task_ctx);
-            let batches = collect_all_partitions(&exec_arc, task_ctx, &mut reservation).await?;
+            let _concatenated =
+                collect_all_partitions(&exec_arc, task_ctx, &mut reservation).await?;
             // The fixpoint driver spans the whole stratum and is a child of
             // nothing, so this is the only place it can be observed (#177).
             // Recorded only while profiling, so the walk is not paid otherwise.
@@ -976,46 +978,35 @@ async fn run_program(
                 stratum_operators = crate::query::executor::core::collect_plan_metrics(&exec_arc);
             }
 
-            // FixpointExec concatenates all rules' output; store per-rule.
-            // For now, store all output under each rule name (since FixpointExec
-            // handles per-rule state internally, the output is already correct).
-            // NOTE(deferred): Per-rule fact demultiplexing is not yet implemented.
-            // FixpointExec concatenates all rules' output into a single batch stream.
-            // Proper demux requires FixpointExec to tag output batches with rule identity
-            // (e.g. an extra column or side-channel), which is a non-trivial change to
-            // run_fixpoint_loop. The current schema-field-count heuristic (filter below)
-            // works because recursive stratum rules share compatible schemas.
-            // Revisit when cross-stratum consumption of individual recursive rules is needed.
+            // `batches` concatenates every rule of the stratum; each rule's own
+            // facts come from the per-rule slot. Storing the concatenation under
+            // every name gave mutually recursive rules each other's rows.
+            let per_rule = per_rule_output
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             for rule in &stratum.rules {
                 // Skip DERIVE-only rules (empty yield_schema).
                 if rule.yield_schema.is_empty() {
                     continue;
                 }
-                // Write converged facts into registry handles for cross-stratum consumers
-                let rule_entries = registry.entries_for_rule(&rule.name);
-                for entry in rule_entries {
+                let facts: Vec<RecordBatch> = per_rule.get(&rule.name).cloned().unwrap_or_default();
+                // Write converged facts into registry handles for cross-stratum
+                // consumers; FixpointExec already wrote the self-ref handles.
+                for entry in registry.entries_for_rule(&rule.name) {
                     if !entry.is_self_ref {
-                        // Cross-stratum handles get the full fixpoint output
-                        // In practice, FixpointExec already wrote self-ref handles;
-                        // we need to write non-self-ref handles for later strata.
-                        let all_facts: Vec<RecordBatch> = batches
-                            .iter()
-                            .filter(|b| {
-                                // If schemas match, this batch belongs to this rule
-                                let rule_schema = yield_columns_to_arrow_schema(&rule.yield_schema);
-                                b.schema().fields().len() == rule_schema.fields().len()
-                            })
-                            .cloned()
-                            .collect();
                         let mut guard = entry.data.write();
-                        *guard = if all_facts.is_empty() {
+                        *guard = if facts.is_empty() {
                             vec![RecordBatch::new_empty(Arc::clone(&entry.schema))]
                         } else {
-                            all_facts
+                            facts.clone()
                         };
                     }
                 }
-                derived_store.insert(rule.name.clone(), batches.clone());
+                if !facts_are_per_path(rule) {
+                    super::locy_fixpoint::debug_assert_facts_are_rows(&rule.name, &facts);
+                }
+                derived_store.insert(rule.name.clone(), facts);
             }
         } else {
             // Non-recursive: single-pass evaluation
@@ -1211,6 +1202,20 @@ async fn run_program(
                 )
                 .await?;
 
+                // A fact is a row: two derivations of the same row are one fact,
+                // as the fixpoint's delta computation makes them in a recursive
+                // stratum. Except under ALONG, whose facts are per path (#159):
+                // the recursive path keeps one row per path through its hidden
+                // derivation columns, so deduplicating here collapsed two
+                // parallel edges carrying the same value into one row, and a
+                // downstream SUM under-counted — the same rule gave a different
+                // answer once a recursive clause was added.
+                let facts = if facts_are_per_path(rule) {
+                    facts
+                } else {
+                    super::locy_fixpoint::dedup_fact_rows(facts)?
+                };
+
                 // Profiling: record this rule's single non-recursive pass.
                 if let Some(ref c) = collector {
                     let fact_count: usize = facts.iter().map(|b| b.num_rows()).sum();
@@ -1226,6 +1231,9 @@ async fn run_program(
 
                 // Write facts into registry handles for later strata
                 write_facts_to_registry(&registry, &rule.name, &facts);
+                if !facts_are_per_path(rule) {
+                    super::locy_fixpoint::debug_assert_facts_are_rows(&rule.name, &facts);
+                }
                 derived_store.insert(rule.name.clone(), facts);
             }
         }
@@ -1549,14 +1557,29 @@ fn convert_to_fixpoint_plans(
                 .map(|(i, _)| i)
                 .collect();
 
+            // A rule with no FOLD, ALONG or PROB column has set semantics: its
+            // facts are deduplicated, so how many ways a body row was derived
+            // cannot matter, and a variable-length relationship in the body may
+            // be searched for reachability rather than enumerated per path. A
+            // FOLD counts or sums derivations, and ALONG and PROB are per path
+            // or per proof, so those rules see every path.
+            let set_semantics =
+                rule.fold_bindings.is_empty() && !rule.yield_schema.iter().any(|yc| yc.is_prob);
             let clauses: Vec<FixpointClausePlan> = rule
                 .clauses
                 .iter()
                 .map(|clause| {
                     let is_ref_bindings =
                         convert_is_refs(&clause.is_refs, registry, &stratum_rule_names)?;
+                    let body_logical = if set_semantics && clause.along_bindings.is_empty() {
+                        crate::query::planner::LogicalPlan::MultiplicityInsensitive {
+                            input: Box::new(clause.body.clone()),
+                        }
+                    } else {
+                        clause.body.clone()
+                    };
                     Ok(FixpointClausePlan {
-                        body_logical: clause.body.clone(),
+                        body_logical,
                         is_ref_bindings,
                         priority: clause.priority,
                         along_bindings: clause.along_bindings.clone(),
@@ -1999,6 +2022,13 @@ pub fn stats_schema() -> SchemaRef {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+/// Whether a rule's facts are one row per derivation path rather than a set:
+/// a rule with ALONG (#159). Equal-valued rows from distinct paths are distinct
+/// facts there, so neither deduplication nor the row invariant applies.
+fn facts_are_per_path(rule: &crate::query::planner_locy_types::LocyRulePlan) -> bool {
+    rule.clauses.iter().any(|c| !c.along_bindings.is_empty())
+}
 
 #[cfg(test)]
 mod tests {

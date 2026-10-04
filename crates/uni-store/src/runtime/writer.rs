@@ -2447,8 +2447,10 @@ impl Writer {
             if let Some(unique_props) = constraint.constraint_type.unique_properties() {
                 // Build compound OR filter for all batch vertices
                 let mut or_filters = Vec::new();
+                let mut batch_key_sets: Vec<Vec<(String, Value)>> = Vec::new();
                 for properties in properties_batch.iter() {
                     let mut and_parts = Vec::new();
+                    let mut key_set = Vec::new();
                     let mut all_present = true;
                     for prop in unique_props {
                         if let Some(val) = properties.get(prop) {
@@ -2457,6 +2459,7 @@ impl Writer {
                                 break;
                             };
                             and_parts.push(FilterExpr::equals(prop.as_str(), scalar));
+                            key_set.push((prop.clone(), val.clone()));
                         } else {
                             all_present = false;
                             break;
@@ -2464,6 +2467,7 @@ impl Writer {
                     }
                     if all_present {
                         or_filters.push(FilterExpr::all(and_parts));
+                        batch_key_sets.push(key_set);
                     }
                 }
 
@@ -2478,23 +2482,28 @@ impl Writer {
                         )),
                     ]);
 
-                    // Count flushed duplicates through the `StorageBackend`
-                    // (branch-aware, correct `.lance` path). A missing table
-                    // means nothing is flushed yet — the L0/pending/tx checks
-                    // above already covered in-memory rows — so skip cleanly;
-                    // any other backend error must abort the write rather than
-                    // silently fail open (the prior `open_raw()` foot-gun).
-                    let backend = self.storage.backend();
-                    let table = table_names::vertex_table_name(label);
-                    if backend.table_exists(&table).await? {
-                        let count = backend.count_rows(&table, Some(&filter)).await?;
-                        if count > 0 {
-                            return Err(anyhow!(
-                                "Constraint violation: Duplicate composite key for label '{}' in storage (constraint '{}')",
-                                label,
-                                constraint.name
-                            ));
-                        }
+                    // Flushed rows matching a batch key are candidates, resolved
+                    // to their current values by `vertex_key_held`. A missing
+                    // table means nothing is flushed yet — the L0/pending/tx
+                    // checks above covered in-memory rows — and any backend
+                    // error aborts the write rather than failing open.
+                    let exclude: HashSet<Vid> = vids.iter().copied().collect();
+                    if self
+                        .vertex_key_held(
+                            label,
+                            Vec::new(),
+                            filter,
+                            &batch_key_sets,
+                            &exclude,
+                            tx_l0,
+                        )
+                        .await?
+                    {
+                        return Err(anyhow!(
+                            "Constraint violation: Duplicate composite key for label '{}' in storage (constraint '{}')",
+                            label,
+                            constraint.name
+                        ));
                     }
                 }
             }
@@ -2706,12 +2715,19 @@ impl Writer {
         // the `_vid !=` clause entirely rather than emit an out-of-range literal.)
         let exclude = exclude_vid.unwrap_or_else(|| Vid::new(u64::MAX));
 
+        // Every layer yields *candidates*: vertices that held this key at some
+        // point. Whether one still holds it is decided below against its
+        // current, fully resolved properties — a key index entry or a storage
+        // row can outlive the value (an unflushed delete or SET, or an older
+        // appended row version).
+        let mut l0_candidates: Vec<Vid> = Vec::new();
+
         // 1. Check L0 (in-memory) using O(1) constraint index
         {
             let l0 = self.l0_manager.get_current();
             let l0_guard = l0.read();
             if l0_guard.has_constraint_key(&key, exclude) {
-                return Ok(true);
+                l0_candidates.extend(l0_guard.constraint_index.get(&key).copied());
             }
         }
 
@@ -2723,8 +2739,9 @@ impl Writer {
         // paths (e.g. `check_extid_globally_unique`, `get_vertex_labels`) that
         // already consult `pending_flush`.
         for pending_l0 in self.l0_manager.get_pending_flush() {
-            if pending_l0.read().has_constraint_key(&key, exclude) {
-                return Ok(true);
+            let guard = pending_l0.read();
+            if guard.has_constraint_key(&key, exclude) {
+                l0_candidates.extend(guard.constraint_index.get(&key).copied());
             }
         }
 
@@ -2732,7 +2749,7 @@ impl Writer {
         if let Some(tx_l0) = tx_l0 {
             let tx_l0_guard = tx_l0.read();
             if tx_l0_guard.has_constraint_key(&key, exclude) {
-                return Ok(true);
+                l0_candidates.extend(tx_l0_guard.constraint_index.get(&key).copied());
             }
         }
 
@@ -2762,19 +2779,96 @@ impl Writer {
         // 2. Check Storage (L1/L2) through the `StorageBackend` (branch-aware,
         // correct `.lance` path). Skip cleanly when the table is not yet
         // flushed; propagate any real backend error instead of failing open.
+        let exclude_set: HashSet<Vid> = exclude_vid.into_iter().collect();
+        self.vertex_key_held(
+            label,
+            l0_candidates,
+            filter,
+            std::slice::from_ref(&key_values.to_vec()),
+            &exclude_set,
+            tx_l0,
+        )
+        .await
+    }
+
+    /// Whether a live vertex of `label` other than those in `exclude` holds one
+    /// of `keys` right now.
+    ///
+    /// Candidates come from `l0_candidates` and from the flushed rows matching
+    /// `storage_filter`; each is resolved to its current properties (L0
+    /// tombstones and overrides, latest row version) and conflicts only if
+    /// those still equal a key in full. Counting matching rows instead reported
+    /// a key as taken after its owner was deleted but not yet flushed, and after
+    /// a flushed `SET` moved it — vertex tables are append-only, so the older
+    /// row version stays and still matches.
+    ///
+    /// # Errors
+    /// Propagates backend and property-resolution failures; the check fails
+    /// closed rather than treating a key as free.
+    async fn vertex_key_held(
+        &self,
+        label: &str,
+        l0_candidates: Vec<Vid>,
+        storage_filter: FilterExpr,
+        keys: &[Vec<(String, Value)>],
+        exclude: &HashSet<Vid>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<bool> {
+        let mut candidates: HashSet<Vid> = l0_candidates.into_iter().collect();
         #[cfg(feature = "lance-backend")]
         {
             let backend = self.storage.backend();
             let table = table_names::vertex_table_name(label);
             if backend.table_exists(&table).await? {
-                let count = backend.count_rows(&table, Some(&filter)).await?;
-                if count > 0 {
-                    return Ok(true);
+                let Some(_) = self.property_manager.as_ref() else {
+                    // No resolver wired: keep the conservative row count.
+                    let count = backend.count_rows(&table, Some(&storage_filter)).await?;
+                    return Ok(count > 0 || !candidates.is_empty());
+                };
+                let batches = backend
+                    .scan(
+                        crate::backend::types::ScanRequest::all(&table)
+                            .with_columns(vec!["_vid".to_string()])
+                            .with_filter(storage_filter),
+                    )
+                    .await?;
+                for batch in &batches {
+                    if let Some(col) = batch
+                        .column_by_name("_vid")
+                        .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
+                    {
+                        candidates.extend(col.iter().flatten().map(Vid::new));
+                    }
                 }
             }
         }
-
-        Ok(false)
+        candidates.retain(|v| !exclude.contains(v));
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let Some(pm) = self.property_manager.as_ref() else {
+            return Ok(true);
+        };
+        let key_props: Vec<String> = keys
+            .iter()
+            .flat_map(|k| k.iter().map(|(p, _)| p.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let candidates: Vec<Vid> = candidates.into_iter().collect();
+        let ctx = self.get_query_context(tx_l0).await;
+        let current = pm
+            .get_batch_vertex_props_for_label_projected(
+                &candidates,
+                label,
+                ctx.as_ref(),
+                Some(&key_props),
+            )
+            .await?;
+        Ok(current.values().any(|props| {
+            keys.iter()
+                .any(|key| key.iter().all(|(p, v)| props.get(p) == Some(v)))
+        }))
     }
 
     /// Edge counterpart of [`validate_vertex_constraints`](Self::validate_vertex_constraints):

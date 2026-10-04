@@ -1773,6 +1773,21 @@ pub enum LogicalPlan {
         inner: Box<LogicalPlan>,
         kind: FusionKind,
     },
+    /// Marks a subplan whose consumer ignores row multiplicity.
+    ///
+    /// The consumer only asks *whether* rows exist or *which distinct* rows
+    /// exist: an `EXISTS` subquery or pattern predicate, or the body of a Locy
+    /// rule with set semantics. Inside it, a variable-length relationship with
+    /// no bound variable may be planned as a reachability search (one row per
+    /// endpoint and depth) instead of one row per path — linear rather than
+    /// exponential on a dense cyclic graph. Everywhere else openCypher requires
+    /// one row per path.
+    ///
+    /// Purely a planning hint: the physical planner plans `input` with the hint
+    /// set and adds no operator of its own.
+    MultiplicityInsensitive {
+        input: Box<LogicalPlan>,
+    },
     /// Lookup vertices by ext_id using the main vertices table.
     /// Used when a query references ext_id without specifying a label.
     ExtIdLookup {
@@ -2279,7 +2294,8 @@ impl LogicalPlan {
             | LogicalPlan::LocyBestBy { input, .. }
             | LogicalPlan::LocyPriority { input, .. }
             | LogicalPlan::LocyProject { input, .. }
-            | LogicalPlan::LocyModelInvoke { input, .. } => Some(input),
+            | LogicalPlan::LocyModelInvoke { input, .. }
+            | LogicalPlan::MultiplicityInsensitive { input } => Some(input),
             _ => None,
         }
     }
@@ -2334,6 +2350,7 @@ impl LogicalPlan {
             | LogicalPlan::BindZeroLengthPath { input, .. }
             | LogicalPlan::BindPath { input, .. }
             | LogicalPlan::FusedIndexScanWrapped { inner: input, .. }
+            | LogicalPlan::MultiplicityInsensitive { input }
             | LogicalPlan::LocyFold { input, .. }
             | LogicalPlan::LocyBestBy { input, .. }
             | LogicalPlan::LocyPriority { input, .. }
@@ -2361,6 +2378,67 @@ impl LogicalPlan {
         }
         self
     }
+}
+
+/// The inline `WHERE` predicates of a pattern's nodes and relationships.
+///
+/// Each is a filter over the whole match, so it can be ANDed into the clause's
+/// WHERE. The two places where that is not equivalent are refused: a
+/// variable-length relationship's predicate applies to every edge, not to the
+/// list the variable binds, and an element inside a quantified sub-pattern
+/// applies per iteration.
+///
+/// # Errors
+/// Returns an error for an inline `WHERE` in either of those positions.
+fn inline_element_predicates(pattern: &Pattern) -> Result<Vec<Expr>> {
+    fn walk(elements: &[PatternElement], quantified: bool, out: &mut Vec<Expr>) -> Result<()> {
+        for elem in elements {
+            match elem {
+                PatternElement::Node(n) => {
+                    if let Some(w) = &n.where_clause {
+                        if quantified {
+                            return Err(anyhow!(
+                                "An inline WHERE on a node inside a quantified path pattern \
+                                 is not supported; filter the matched path instead"
+                            ));
+                        }
+                        out.push(w.clone());
+                    }
+                }
+                PatternElement::Relationship(r) => {
+                    if let Some(w) = &r.where_clause {
+                        if quantified || r.range.is_some() {
+                            return Err(anyhow!(
+                                "An inline WHERE on a variable-length or quantified \
+                                 relationship is not supported: it would apply to each edge, \
+                                 not to the list the variable binds. Use \
+                                 `all(e IN r WHERE ...)` in the MATCH's WHERE instead"
+                            ));
+                        }
+                        out.push(w.clone());
+                    }
+                }
+                PatternElement::Parenthesized { pattern, .. } => {
+                    walk(&pattern.elements, true, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for path in &pattern.paths {
+        walk(&path.elements, false, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// `preds` joined with AND, or `None` when there are none.
+fn and_predicates(preds: impl IntoIterator<Item = Expr>) -> Option<Expr> {
+    preds.into_iter().reduce(|l, r| Expr::BinaryOp {
+        left: Box::new(l),
+        op: BinaryOp::And,
+        right: Box::new(r),
+    })
 }
 
 /// Extracted vector similarity predicate info for optimization
@@ -4519,9 +4597,45 @@ impl QueryPlanner {
     ) -> Result<LogicalPlan> {
         let mut plan = plan;
 
+        // Inline element predicates — `(m WHERE m.id = 3)`, `[r WHERE r.w = 1]`
+        // — belong to the clause's WHERE. Nothing downstream applied them, so
+        // they were silently ignored.
+        let folded;
+        let match_clause = match and_predicates(
+            inline_element_predicates(&match_clause.pattern)?
+                .into_iter()
+                .chain(match_clause.where_clause.clone()),
+        ) {
+            Some(where_clause) if Some(&where_clause) != match_clause.where_clause.as_ref() => {
+                folded = MatchClause {
+                    where_clause: Some(where_clause),
+                    ..match_clause.clone()
+                };
+                &folded
+            }
+            _ => match_clause,
+        };
+
         if match_clause.pattern.paths.is_empty() {
             return Err(anyhow!("Empty pattern"));
         }
+
+        // Relationship uniqueness spans the whole clause, so a relationship
+        // after a variable-length one must see the edges that one walked. It
+        // does through the step variable's edge list; an anonymous one has
+        // none, and without it the engine silently let a later hop reuse an
+        // edge the variable-length hop had already walked.
+        let named;
+        let match_clause = match self.name_anonymous_variable_length(&match_clause.pattern) {
+            Some(pattern) => {
+                named = MatchClause {
+                    pattern,
+                    ..match_clause.clone()
+                };
+                &named
+            }
+            None => match_clause,
+        };
 
         // Track variables introduced by this OPTIONAL MATCH
         let vars_before_pattern = vars_in_scope.len();
@@ -4552,7 +4666,7 @@ impl QueryPlanner {
             .map(Self::equality_anchored_properties)
             .unwrap_or_default();
 
-        for path in paths {
+        for &path in &paths {
             if let Some(mode) = &path.shortest_path_mode {
                 plan =
                     self.plan_shortest_path(path, plan, vars_in_scope, mode, vars_before_pattern)?;
@@ -4580,10 +4694,120 @@ impl QueryPlanner {
 
         // Handle WHERE clause with vector_similarity and predicate pushdown
         if let Some(predicate) = &match_clause.where_clause {
-            plan = self.plan_where_clause(predicate, plan, vars_in_scope, optional_vars)?;
+            plan = self.plan_where_clause(predicate, plan, vars_in_scope, optional_vars.clone())?;
+        }
+
+        // Close the clause. Each traversal inside it decides "this row found no
+        // match" for the rows it sees, which is exact only for the step the
+        // rows enter by: past it, one entering row is spread over several rows
+        // and batches, so each dead end emitted its own NULL row, and a later
+        // path extended rows an earlier one had already failed. One operator
+        // over the whole clause's output makes the decision per entering row.
+        if match_clause.optional
+            && !optional_vars.is_empty()
+            && Self::optional_clause_has_several_steps(
+                &paths,
+                &vars_in_scope[..vars_before_pattern],
+            )
+            && !matches!(
+                &plan,
+                LogicalPlan::Filter { optional_variables, .. } if *optional_variables == optional_vars
+            )
+        {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: Expr::Literal(CypherLiteral::Bool(true)),
+                optional_variables: optional_vars,
+            };
         }
 
         Ok(plan)
+    }
+
+    /// `pattern` with a hidden step variable on every anonymous
+    /// variable-length relationship, when the clause has another relationship
+    /// that relationship uniqueness must keep off its edges; `None` when
+    /// nothing needs one.
+    ///
+    /// The name comes from [`Self::next_anon_var`], so it is as hidden as any
+    /// other generated variable. Shortest-path patterns enumerate no edge list
+    /// and are left alone.
+    fn name_anonymous_variable_length(&self, pattern: &Pattern) -> Option<Pattern> {
+        let relationships: usize = pattern
+            .paths
+            .iter()
+            .flat_map(|path| &path.elements)
+            .map(|element| match element {
+                PatternElement::Node(_) => 0,
+                PatternElement::Relationship(_) => 1,
+                PatternElement::Parenthesized { .. } => 2,
+            })
+            .sum();
+        let needs_name = |element: &PatternElement| {
+            matches!(
+                element,
+                PatternElement::Relationship(r)
+                    if r.range.is_some() && r.variable.as_deref().is_none_or(str::is_empty)
+            )
+        };
+        if relationships < 2
+            || !pattern
+                .paths
+                .iter()
+                .filter(|path| path.shortest_path_mode.is_none())
+                .flat_map(|path| &path.elements)
+                .any(needs_name)
+        {
+            return None;
+        }
+        let mut pattern = pattern.clone();
+        for path in pattern
+            .paths
+            .iter_mut()
+            .filter(|path| path.shortest_path_mode.is_none())
+        {
+            for element in &mut path.elements {
+                if needs_name(element)
+                    && let PatternElement::Relationship(r) = element
+                {
+                    r.variable = Some(self.next_anon_var());
+                }
+            }
+        }
+        Some(pattern)
+    }
+
+    /// Whether an OPTIONAL MATCH takes more than one step from the rows
+    /// entering it: more than one path, more than one relationship, or a
+    /// relationship out of a node the clause itself scans for.
+    ///
+    /// A single relationship out of an already-bound node decides "no match"
+    /// per entering row by construction and needs no closing operator.
+    fn optional_clause_has_several_steps(
+        paths: &[&PathPattern],
+        bound_before_clause: &[VariableInfo],
+    ) -> bool {
+        if paths.len() != 1 {
+            return true;
+        }
+        let elements = &paths[0].elements;
+        let steps: usize = elements
+            .iter()
+            .map(|element| match element {
+                PatternElement::Node(_) => 0,
+                PatternElement::Relationship(_) => 1,
+                // A quantified group is at least one step and usually more.
+                PatternElement::Parenthesized { .. } => 2,
+            })
+            .sum();
+        let starts_unbound = match elements.first() {
+            Some(PatternElement::Node(n)) => n
+                .variable
+                .as_deref()
+                .is_none_or(|v| v.is_empty() || !is_var_in_scope(bound_before_clause, v)),
+            _ => true,
+        };
+        steps + usize::from(starts_unbound && steps > 0) > 1
     }
 
     /// Plan a shortestPath pattern.
@@ -4835,6 +5059,18 @@ impl QueryPlanner {
         vars_in_scope.clear();
         vars_in_scope.extend_from_slice(initial_vars);
         let vars_before_pattern = vars_in_scope.len();
+        // As in `plan_match_clause`: without a step variable, an anonymous
+        // variable-length relationship publishes no edges, and a later hop
+        // reused them — a Locy rule body `(a)-[*1..2]->()-[]->(b)` derived
+        // pairs only an edge-reusing walk reaches.
+        let named;
+        let pattern = match self.name_anonymous_variable_length(pattern) {
+            Some(p) => {
+                named = p;
+                &named
+            }
+            None => pattern,
+        };
         let mut plan = LogicalPlan::Empty;
         for path in &pattern.paths {
             plan = self.plan_path(
@@ -4845,6 +5081,14 @@ impl QueryPlanner {
                 vars_before_pattern,
                 where_anchored,
             )?;
+        }
+        // Inline element predicates, as in `plan_match_clause`.
+        if let Some(predicate) = and_predicates(inline_element_predicates(pattern)?) {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+                optional_variables: HashSet::new(),
+            };
         }
         Ok(plan)
     }
@@ -5338,14 +5582,25 @@ impl QueryPlanner {
 
         // For OPTIONAL MATCH, extract all variables from this pattern upfront.
         // When any hop fails in a multi-hop pattern, ALL these variables should be NULL.
+        //
+        // "This pattern" is the whole clause: a variable an earlier
+        // comma-separated path of the same clause bound is in scope here, but
+        // it is still the clause's own. Excluding it made this path's first
+        // hop treat every row as newly entering the clause — re-tagging it and
+        // null-filling per earlier match — and left that path's variables
+        // standing on rows where this path failed.
+        let bound_before_clause = &vars_in_scope[..vars_before_pattern];
         let mut optional_pattern_vars: HashSet<String> = if optional {
-            let mut vars = HashSet::new();
+            let mut vars: HashSet<String> = vars_in_scope[vars_before_pattern..]
+                .iter()
+                .map(|v| v.name.clone())
+                .collect();
             for element in elements {
                 match element {
                     PatternElement::Node(n) => {
                         if let Some(v) = &n.variable
                             && !v.is_empty()
-                            && !is_var_in_scope(vars_in_scope, v)
+                            && !is_var_in_scope(bound_before_clause, v)
                         {
                             vars.insert(v.clone());
                         }
@@ -5353,7 +5608,7 @@ impl QueryPlanner {
                     PatternElement::Relationship(r) => {
                         if let Some(v) = &r.variable
                             && !v.is_empty()
-                            && !is_var_in_scope(vars_in_scope, v)
+                            && !is_var_in_scope(bound_before_clause, v)
                         {
                             vars.insert(v.clone());
                         }
@@ -5365,7 +5620,7 @@ impl QueryPlanner {
                                 PatternElement::Node(n) => {
                                     if let Some(v) = &n.variable
                                         && !v.is_empty()
-                                        && !is_var_in_scope(vars_in_scope, v)
+                                        && !is_var_in_scope(bound_before_clause, v)
                                     {
                                         vars.insert(v.clone());
                                     }
@@ -5373,7 +5628,7 @@ impl QueryPlanner {
                                 PatternElement::Relationship(r) => {
                                     if let Some(v) = &r.variable
                                         && !v.is_empty()
-                                        && !is_var_in_scope(vars_in_scope, v)
+                                        && !is_var_in_scope(bound_before_clause, v)
                                     {
                                         vars.insert(v.clone());
                                     }
@@ -5787,6 +6042,23 @@ impl QueryPlanner {
                             }
                             all_edge_type_ids.extend_from_slice(&step_edge_type_ids);
 
+                            // A step node carries a single-label constraint.
+                            // `(:A:B)` or `(:A|B)` would be checked against `A`
+                            // alone, matching nodes the pattern excludes or
+                            // missing ones it admits, so refuse rather than
+                            // answer a different question.
+                            if node.labels.len() > 1 {
+                                return Err(anyhow!(
+                                    "Quantified path patterns support at most one label on an \
+                                     inner node, but a node is labelled `{}`. Filter the extra \
+                                     labels with a WHERE clause instead.",
+                                    node.labels.names().join(if node.labels.is_disjunction() {
+                                        "|"
+                                    } else {
+                                        ":"
+                                    })
+                                ));
+                            }
                             let target_label = node.labels.first().and_then(|l| {
                                 self.schema.get_label_case_insensitive(l).map(|_| l.clone())
                             });
@@ -6473,7 +6745,12 @@ impl QueryPlanner {
         // traverse output. Mirrors the schema-then-virtual fallthrough used
         // by single-vertex `Scan` planning (~`plan_node_pattern` below).
         let mut virtual_target_label_id: Option<u16> = None;
-        let target_label_meta = if let Some(label_name) = params.target_node.labels.first() {
+        let target_label_meta = if params.target_node.labels.is_proper_disjunction() {
+            // `(m:A|B)`: no single label id describes the target. Leave it
+            // unconstrained and let the target filter apply the disjunction;
+            // pinning the first label dropped every `B` endpoint.
+            None
+        } else if let Some(label_name) = params.target_node.labels.first() {
             // Use first label for target_label_id
             // For schemaless support, allow unknown target labels
             match self.schema.get_label_case_insensitive(label_name) {
@@ -6946,17 +7223,16 @@ impl QueryPlanner {
         plan: LogicalPlan,
         optional: bool,
     ) -> Result<LogicalPlan> {
-        // Properties handling
-        let properties = match &node.properties {
-            Some(Expr::Map(entries)) => entries.as_slice(),
+        // A node's property map must be a literal map.
+        match &node.properties {
+            Some(Expr::Map(_)) | None => {}
             Some(Expr::Parameter(_)) => {
                 return Err(anyhow!(
                     "SyntaxError: InvalidParameterUse - Parameters cannot be used as node predicates"
                 ));
             }
             Some(_) => return Err(anyhow!("Node properties must be a Map")),
-            None => &[],
-        };
+        }
 
         let has_existing_scope = !matches!(plan, LogicalPlan::Empty);
 
@@ -6978,48 +7254,14 @@ impl QueryPlanner {
             (self.properties_to_expr(variable, &node.properties), None)
         };
 
-        // Check for ext_id in properties when no label is specified
+        // An unlabelled node — `(n {ext_id: 'x'})` included — scans the shared
+        // vertex table. An ext_id equality is pushed down to its index by the
+        // physical planner (`ext_id_equality`). A dedicated lookup operator
+        // used to handle ext_id here: it read flushed rows only, so a committed
+        // but unflushed vertex was not found, projected no properties
+        // (`RETURN n.name` failed to plan), and returned every property as a
+        // string.
         if node.labels.is_empty() {
-            // Try to find ext_id property for main table lookup
-            if let Some((_, ext_id_value)) = properties.iter().find(|(k, _)| k == "ext_id") {
-                // Extract the ext_id value as a string
-                let ext_id = match ext_id_value {
-                    Expr::Literal(CypherLiteral::String(s)) => s.clone(),
-                    _ => {
-                        return Err(anyhow!("ext_id must be a string literal for direct lookup"));
-                    }
-                };
-
-                // Build filter for remaining properties (excluding ext_id)
-                let remaining_props: Vec<_> = properties
-                    .iter()
-                    .filter(|(k, _)| k != "ext_id")
-                    .cloned()
-                    .collect();
-
-                let remaining_expr = if remaining_props.is_empty() {
-                    None
-                } else {
-                    Some(Expr::Map(remaining_props))
-                };
-
-                let (prop_filter, residual_filter) = if has_existing_scope {
-                    self.split_node_property_filters_for_scan(variable, &remaining_expr)
-                } else {
-                    (self.properties_to_expr(variable, &remaining_expr), None)
-                };
-
-                let ext_id_lookup = LogicalPlan::ExtIdLookup {
-                    variable: variable.to_string(),
-                    ext_id,
-                    filter: prop_filter,
-                    optional,
-                };
-
-                let joined = Self::join_with_plan(plan, ext_id_lookup);
-                return Ok(apply_residual_filter(joined, residual_filter));
-            }
-
             // No ext_id: create ScanAll for unlabeled node pattern
             let scan_all = LogicalPlan::ScanAll {
                 variable: variable.to_string(),
@@ -8415,14 +8657,22 @@ impl QueryPlanner {
     pub fn node_filter_expr(
         &self,
         variable: &str,
-        labels: &[String],
+        labels: &uni_cypher::ast::LabelExpr,
         properties: &Option<Expr>,
     ) -> Option<Expr> {
-        let mut final_expr = None;
-
-        // Add label checks using hasLabel(variable, 'label')
-        for label in labels {
-            let label_check = Expr::FunctionCall {
+        // Label checks via `hasLabel(variable, 'label')`, combined by the label
+        // expression's own operator. `LabelExpr` derefs to its bare names, and
+        // taking those as `&[String]` ANDed every label: `(m:Robot|C)` on a
+        // traversal target required both and matched nothing.
+        let op = if labels.is_disjunction() {
+            BinaryOp::Or
+        } else {
+            BinaryOp::And
+        };
+        let mut final_expr = labels
+            .names()
+            .iter()
+            .map(|label| Expr::FunctionCall {
                 name: "hasLabel".to_string(),
                 args: vec![
                     Expr::Variable(variable.to_string()),
@@ -8430,17 +8680,12 @@ impl QueryPlanner {
                 ],
                 distinct: false,
                 window_spec: None,
-            };
-
-            final_expr = match final_expr {
-                Some(e) => Some(Expr::BinaryOp {
-                    left: Box::new(e),
-                    op: BinaryOp::And,
-                    right: Box::new(label_check),
-                }),
-                None => Some(label_check),
-            };
-        }
+            })
+            .reduce(|l, r| Expr::BinaryOp {
+                left: Box::new(l),
+                op,
+                right: Box::new(r),
+            });
 
         // Add property checks
         if let Some(prop_expr) = self.properties_to_expr(variable, properties) {
@@ -8594,6 +8839,7 @@ impl QueryPlanner {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::MultiplicityInsensitive { input }
             | LogicalPlan::Apply { input, .. } => Self::find_scan_label_id(input, variable),
             LogicalPlan::CrossJoin { left, right } => Self::find_scan_label_id(left, variable)
                 .or_else(|| Self::find_scan_label_id(right, variable)),
@@ -9046,7 +9292,8 @@ impl QueryPlanner {
             | LogicalPlan::InvertedIndexLookup { variable, .. } => {
                 vars.insert(variable.clone());
             }
-            LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            LogicalPlan::FusedIndexScanWrapped { inner, .. }
+            | LogicalPlan::MultiplicityInsensitive { input: inner } => {
                 Self::collect_plan_variables_impl(inner, vars);
             }
             LogicalPlan::TraverseMainByType {
@@ -9381,6 +9628,7 @@ pub fn projection_columns(plan: &LogicalPlan) -> Option<Vec<String>> {
         // Row-preserving wrappers: the columns are whatever the input projects.
         LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::MultiplicityInsensitive { input }
         | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Filter { input, .. } => projection_columns(input),
         // Both branches are validated to carry the same column names when the
@@ -10355,12 +10603,17 @@ pub(crate) fn reconcile_passthrough_properties(
         }
     }
 
-    // Fold each alias's accessed properties onto its source. This is
-    // unconditional and safe: if the source is later kept wide the extra
-    // properties are subsumed by "*", and if it is narrowed it needs exactly
-    // these. A single non-cascading pass (props are read from a pre-fold
-    // snapshot) suffices because rename *chains* keep their endpoints wide (see
-    // `keep_wide` below), so cascading folds are never required for correctness.
+    // Fold each alias's accessed properties onto every variable it renames,
+    // following the whole chain (`WITH n AS a WITH a AS x`: `x`'s properties
+    // reach `n`). This is unconditional and safe: if a source is kept wide the
+    // extra properties are subsumed by "*", and if it is narrowed it needs
+    // exactly these.
+    //
+    // The fold used to stop after one link, on the grounds that rename chains
+    // keep their endpoints wide. Wide is not enough for an unlabelled or
+    // schemaless scan: "*" there loads only the `_all_props` blob, so `x.id`
+    // two renames up found no `id` and compiled to NULL — or, after a MERGE
+    // re-encoded the entity, failed to plan.
     let real_props: HashMap<String, Vec<String>> = properties
         .iter()
         .map(|(v, set)| {
@@ -10376,14 +10629,21 @@ pub(crate) fn reconcile_passthrough_properties(
             (v.clone(), props)
         })
         .collect();
-    for (alias, src) in &alias_source {
-        if let Some(props) = real_props.get(alias)
-            && !props.is_empty()
-        {
+    for (alias, first) in &alias_source {
+        let Some(props) = real_props.get(alias).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let mut seen: HashSet<&String> = HashSet::from([alias]);
+        let mut src = first;
+        while seen.insert(src) {
             properties
                 .entry(src.clone())
                 .or_default()
                 .extend(props.iter().cloned());
+            match alias_source.get(src) {
+                Some(next) => src = next,
+                None => break,
+            }
         }
     }
 
@@ -11146,7 +11406,8 @@ fn collect_properties_recursive(
             collect_properties_from_expr_into(expr, properties, kinds);
         }
         LogicalPlan::FusedIndexScan { filter: None, .. } => {}
-        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+        LogicalPlan::FusedIndexScanWrapped { inner, .. }
+        | LogicalPlan::MultiplicityInsensitive { input: inner } => {
             collect_properties_recursive(inner, properties, kinds);
         }
         LogicalPlan::Explain { plan } => {

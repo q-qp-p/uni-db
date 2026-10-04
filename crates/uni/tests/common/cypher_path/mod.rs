@@ -10,6 +10,7 @@ pub mod pattern_two_nodes_debug;
 pub mod qpp_group_variables;
 pub mod quantified_pattern_integration;
 pub mod quantifier_e2e_test;
+pub mod vlp_anonymous_path_multiplicity;
 pub mod vlp_debug_simple;
 pub mod vlp_fixes_test;
 pub mod vlp_pattern_predicate_investigation;

@@ -273,6 +273,24 @@ static DUMP_PHYSICAL_PLAN: std::sync::LazyLock<bool> =
 /// the vertex and edge read paths.
 const EXPORT_BATCH: usize = 10_000;
 
+/// The DataFusion session configuration a query runs under.
+///
+/// `UniConfig::parallelism` becomes `target_partitions` and
+/// `UniConfig::execution_batch_size`, when set, becomes `batch_size`; both
+/// were previously ignored, so every query ran with DataFusion's defaults
+/// whatever the config said. Every place that builds a session must use this,
+/// or a knob silently applies to some queries and not others.
+pub fn datafusion_session_config(
+    config: &uni_common::UniConfig,
+) -> datafusion::prelude::SessionConfig {
+    let session =
+        datafusion::prelude::SessionConfig::new().with_target_partitions(config.parallelism.max(1));
+    match config.execution_batch_size {
+        Some(rows) => session.with_batch_size(rows.max(1)),
+        None => session,
+    }
+}
+
 impl Executor {
     /// Helper to verify and filter candidates against an optional predicate.
     ///
@@ -546,15 +564,19 @@ impl Executor {
             let session = if optimizer_providers.is_empty() {
                 match df_runtime.clone() {
                     Some(rt) => SessionContext::new_with_config_rt(
-                        datafusion::prelude::SessionConfig::new(),
+                        datafusion_session_config(&self.config),
                         rt,
                     ),
-                    None => SessionContext::new(),
+                    None => {
+                        SessionContext::new_with_config(datafusion_session_config(&self.config))
+                    }
                 }
             } else {
                 use datafusion::execution::session_state::SessionStateBuilder;
                 use uni_plugin::traits::operator::OptimizerPhase;
-                let mut builder = SessionStateBuilder::new().with_default_features();
+                let mut builder = SessionStateBuilder::new()
+                    .with_config(datafusion_session_config(&self.config))
+                    .with_default_features();
                 if let Some(rt) = df_runtime.clone() {
                     builder = builder.with_runtime_env(rt);
                 }
@@ -1457,6 +1479,7 @@ impl Executor {
             LogicalPlan::Scan { .. } => "read_scan",
             LogicalPlan::FusedIndexScan { .. } => "read_fused_index_scan",
             LogicalPlan::FusedIndexScanWrapped { .. } => "read_fused_index_scan_wrapped",
+            LogicalPlan::MultiplicityInsensitive { .. } => "read_multiplicity_insensitive",
             LogicalPlan::ExtIdLookup { .. } => "read_extid_lookup",
             LogicalPlan::Traverse { .. } => "read_traverse",
             LogicalPlan::TraverseMainByType { .. } => "read_traverse_main",
@@ -1504,6 +1527,7 @@ impl Executor {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Distinct { input }
+            | LogicalPlan::MultiplicityInsensitive { input }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Window { input, .. }
             | LogicalPlan::Unwind { input, .. }
@@ -3454,6 +3478,11 @@ impl Executor {
                         .execute_subplan(*input, prop_manager, params, ctx)
                         .await?;
                     self.execute_project(matches, &projections, prop_manager, params, ctx)
+                        .await
+                }
+                // A planning hint only; the rows are the input's.
+                LogicalPlan::MultiplicityInsensitive { input } => {
+                    self.execute_subplan(*input, prop_manager, params, ctx)
                         .await
                 }
                 LogicalPlan::Distinct { input } => {
@@ -6065,15 +6094,21 @@ impl Executor {
     ) -> Result<()> {
         let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
 
-        for edge in out_graph.edges() {
-            writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
-                .await?;
+        let mut deleted: HashSet<Eid> = HashSet::new();
+        for edge in out_graph.edges().chain(in_graph.edges()) {
+            if deleted.insert(edge.eid) {
+                writer
+                    .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
+                    .await?;
+            }
         }
-        for edge in in_graph.edges() {
-            writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
-                .await?;
+        // Edges created earlier in this transaction are not in the subgraph
+        // above; delete them explicitly rather than relying on the vertex
+        // deletion's cascade, so they are counted and hooked like any other.
+        for (eid, src, dst, edge_type) in tx_incident_edges(vids, tx_l0) {
+            if deleted.insert(eid) {
+                writer.delete_edge(eid, src, dst, edge_type, tx_l0).await?;
+            }
         }
 
         Ok(())
@@ -6172,16 +6207,52 @@ impl Executor {
 
         let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
 
-        for edge in out_graph.edges().chain(in_graph.edges()) {
-            if !tombstoned_eids.contains(&edge.eid) {
+        let loaded = out_graph
+            .edges()
+            .chain(in_graph.edges())
+            .map(|e| (e.eid, e.src_vid));
+        // `batch_load_incident_edges` reads the adjacency CSR and overlay,
+        // which a transaction's own edges never reach until commit. Without
+        // these, a node could be deleted in the transaction that connected
+        // it, and the deletion's cascade silently took the edge with it.
+        let in_tx = tx_incident_edges(vids, tx_l0)
+            .into_iter()
+            .map(|(eid, src, _, _)| (eid, src));
+        for (eid, src) in loaded.chain(in_tx) {
+            if !tombstoned_eids.contains(&eid) {
                 return Err(anyhow!(
                     "ConstraintVerificationFailed: DeleteConnectedNode - Cannot delete node {}, because it still has relationships. To delete the node and its relationships, use DETACH DELETE.",
-                    edge.src_vid
+                    src
                 ));
             }
         }
         Ok(())
     }
+}
+
+/// Live edges in the transaction-local L0 with an endpoint in `vids`, as
+/// `(eid, src, dst, edge_type)`.
+///
+/// A transaction's edges live only in its private buffer until commit — they
+/// are not in the adjacency overlay the subgraph loads read — so anything
+/// asking "which relationships does this node have right now" must add them.
+fn tx_incident_edges(
+    vids: &[Vid],
+    tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+) -> Vec<(Eid, Vid, Vid, u32)> {
+    let Some(tx) = tx_l0 else {
+        return Vec::new();
+    };
+    let wanted: HashSet<Vid> = vids.iter().copied().collect();
+    let guard = tx.read();
+    guard
+        .edge_endpoints
+        .iter()
+        .filter(|(eid, (src, dst, _))| {
+            (wanted.contains(src) || wanted.contains(dst)) && !guard.tombstones.contains_key(eid)
+        })
+        .map(|(eid, (src, dst, edge_type))| (*eid, *src, *dst, *edge_type))
+        .collect()
 }
 
 #[cfg(test)]

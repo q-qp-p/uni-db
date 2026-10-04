@@ -133,6 +133,7 @@ impl UniWorld {
             let mut config = uni_common::UniConfig::default();
             config.auto_flush_interval = None; // Disable auto-flush background task
             config.compaction.enabled = false; // Disable background compaction
+            apply_execution_overrides(&mut config);
             config
         };
 
@@ -393,5 +394,26 @@ impl UniWorld {
 
     pub fn params(&self) -> &HashMap<String, Value> {
         &self.params
+    }
+}
+
+/// Applies `UNI_TCK_PARALLELISM` and `UNI_TCK_EXECUTION_BATCH_SIZE`, when set.
+///
+/// Both knobs are result-neutral, so the suite must pass unchanged under any
+/// value; running it with a single partition and a tiny engine batch is a
+/// determinism check that reuses every scenario's expected result. A value
+/// that does not parse fails loudly rather than silently running the defaults.
+fn apply_execution_overrides(config: &mut uni_common::UniConfig) {
+    let read = |name: &str| {
+        std::env::var(name).ok().map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {v:?}"))
+        })
+    };
+    if let Some(p) = read("UNI_TCK_PARALLELISM") {
+        config.parallelism = p;
+    }
+    if let Some(b) = read("UNI_TCK_EXECUTION_BATCH_SIZE") {
+        config.execution_batch_size = Some(b);
     }
 }

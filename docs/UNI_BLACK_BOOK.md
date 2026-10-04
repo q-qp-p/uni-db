@@ -2629,10 +2629,11 @@ keeps merely naming a position free, and keeps `RETURN t.id` answering exactly
 as the anonymous form does. `EXPLAIN` shows the chosen mode and any live group
 bindings on the `GraphVariableLengthTraverseExec` line.
 
-Known gap, pre-existing and not introduced here: the endpoint-only plan
-collapses distinct paths that share endpoints, so a quantified pattern over a
-diamond reports one row where GQL specifies one row per binding. Projecting a
-group variable enumerates paths and gives the conformant count.
+A pruned quantified pattern, like an anonymous variable-length relationship,
+still yields **one row per path**: the endpoint-only mode is chosen only where
+the consumer ignores multiplicity (see Stage 2). This used to be a known gap —
+a quantified pattern over a diamond reported one row where GQL specifies one
+per binding.
 
 A quantified pattern is compiled to edge type **ids** and has no schemaless
 main-table operator, so a QPP over an undeclared relationship type is
@@ -2708,11 +2709,42 @@ complete.
 
 ### Stage 2 — enumerating paths out of the DAG
 
-Only run when the query actually needs paths — a path variable, a step variable,
-or a QPP group binding. `VlpOutputMode::EndpointsOnly` skips it entirely and
-verifies reachability with `has_trail_valid_path`, which stops at the first
-valid path. This is why `RETURN count(DISTINCT b)` is cheap on a graph where
-`RETURN p` is not.
+Run whenever the result depends on the paths. With no path, step or group
+variable bound there are two modes, and which one is correct depends on the
+consumer, not on the pattern:
+
+- **`EndpointsPerPath`** (the default) enumerates the paths and emits one row
+  per path carrying only the endpoint. openCypher binds a row per matched path
+  whether or not the relationship is named, so `MATCH (x)-[:R*2..2]->(e)
+  RETURN count(*)` over a diamond is 2 — the same as with `[r:R*2..2]`.
+- **`Reachability`** skips enumeration and verifies each `(endpoint, depth)`
+  with `has_trail_valid_path`, which stops at the first valid path. It is only
+  valid where multiplicity cannot be observed.
+
+The planner tracks that with a flag on `HybridPhysicalPlanner`
+(`multiplicity_insensitive`). `LogicalPlan::MultiplicityInsensitive` — a
+planning hint allowed only at a plan's root, stripped by `plan()` before the
+logical pre-passes — sets it for an `EXISTS` subquery or pattern predicate and
+for the body of a set-semantic Locy rule (no FOLD, ALONG or PROB). `Distinct`,
+and an `Aggregate` whose every aggregate is DISTINCT or min/max, set it for
+their input. `Project`, `Filter`, `Sort` and the traversals pass the inherited
+value through; every other operator — `Limit`, a counting aggregate, a join, a
+mutation — plans its subtree as sensitive, the always-correct default. This is
+why `RETURN count(DISTINCT b)` is cheap on a graph where `RETURN count(*)` and
+`RETURN p` are not.
+
+Until 2026-09 the endpoint-only BFS was the default for every anonymous
+relationship, so a plain `MATCH` silently reported one row per endpoint and
+depth — a count that changed when the relationship was given a name. The
+regression tests (`cypher_path::vlp_anonymous_path_multiplicity`) run each
+query shape with the relationship anonymous and named and require identical
+results.
+
+`Reachability` is cheap only where the frontier drains. On a dense cyclic graph
+under an unbounded `*` it runs to the hop ceiling, and the per-depth trail check
+is itself a search over the predecessor DAG: `EXISTS { (a)-[:R*]->(b) }` on a
+9-vertex complete digraph does not finish in minutes. That is a separate
+problem from the mode choice.
 
 Enumeration is a backward depth-first walk from each accepting endpoint. The
 count is **not** bounded by the DAG's size: a DAG with 15,000 accepting entries
@@ -2773,8 +2805,9 @@ regression (#141).
 The limit binds as ordinary **back-pressure** instead: the operator drains at
 most `slice_size` paths per batch, hands the batch downstream, and if nothing
 pulls again the remaining paths are never walked. `slice_size` is DataFusion's
-`SessionConfig::batch_size` — **8192**, not `UniConfig::batch_size` (1024), which
-sizes storage morsels and is a different knob.
+`SessionConfig::batch_size` — **8192** unless `UniConfig::execution_batch_size`
+overrides it. It is not `UniConfig::batch_size` (1024), which is only the page
+size a query cursor hands back.
 
 So the granularity of a limit is one batch, which is directly measurable. On an
 852-vertex / 1013-edge cyclic graph:
@@ -4010,6 +4043,28 @@ Two consequences inside `FixpointState`:
 - Contributions are **replaced** on re-derivation, keyed on every column except the fold inputs, rather than appended. Once a child's folded value can move between iterations, a parent that already emitted a row against the child's partial value would otherwise fold the stale row in alongside the fresh one.
 - Convergence is **value-based**: a clause reading a full snapshot re-derives every iteration, so delta-emptiness alone is not progress. `MonotonicAggState` cannot serve here — it is only ever fed the delta.
 
+#### Derivation identity: what tells two contributions apart
+
+The replace-on-re-derivation merge above is only correct if the derivation key really does identify one derivation. The key is every column except the fold inputs, and the columns that make it discriminating are the hidden `__deriv_*` ones, built by `derivation_discriminators` in `locy_planner.rs` for a recursive rule carrying FOLD or ALONG:
+
+| Column | Projected from | Separates |
+|---|---|---|
+| `__deriv_clause` | the clause index | rows of different clauses, whose other discriminators are NULL-padded |
+| `__deriv_vid_{v}` | `{v}._vid`, a MATCH-bound node not yielded bare | derivations through different nodes |
+| `__deriv_eid_{r}` | `{r}._eid`, a single-hop relationship | **parallel edges** between the same pair of nodes |
+| `__deriv_path_{r}` | `{r}`, the edge list of a variable-length relationship | **distinct paths** between the same endpoints |
+| `__deriv_ref_{c}_{o}` | `__locy_row_hash` of every column of the fact the clause's `o`-th positive same-stratum IS-ref read (contributions view only) | extensions of **different referenced facts** — two sub-paths that share the first hop and diverge below it |
+
+The referenced-fact column hashes the whole referenced row, its own hidden columns included, so the identity chains through the derivation at a fixed 16 bytes (`df_graph/locy_row_hash.rs`). Without it, `0 -> 1` followed by two parallel `1 -> 2` edges of equal weight was one `(0, 2, 3)` fact, not two, and a downstream SUM read 4 instead of 7 — found by the random-program oracle. A reference reading the **folded** view gets no such column: that row is the child's KEY with its current folded value, so hashing it would give a re-derived contribution a new key each iteration, and it would be appended instead of replacing the old one. One consequence: an ALONG rule over a cycle whose values do not grow (a zero-weight cycle) now has a new derivation every lap — infinitely many paths — and reaches the iteration limit, reported as such, where it used to converge on a collapsed answer.
+
+An **anonymous** relationship is bound to the positional name `__anon_edge_{clause}_{path}_{elem}` before the body is planned (`name_anonymous_edges`), so it gets a column too. The name is positional so that an IS-ref target's discriminator schema, computed from the compiled rule, matches the one its own clauses project. Binding a variable does not change which rows the MATCH produces.
+
+Until issue #294 only node vids were used. Two stakes `x -[30]-> a` and `x -[40]-> a` bind the same nodes, so they shared one derivation key and the merge kept whichever row came last — `a` came out as 60 or 50 depending on batch order, never 90. The non-recursive form of the same rule was always right, because it never builds a `FixpointState` and aggregates the plain bag of MATCH rows; that equivalence is what the #294 regression tests check.
+
+The discriminator columns are nullable by construction (a clause that does not bind a variable projects NULL), so `reconcile_schema` marks every `__deriv_*` field nullable before adopting a batch's schema. A relationship's `_eid` is declared non-nullable by the scan, and adopting it verbatim rejected a sibling clause's NULL-padded batch.
+
+In debug builds `merge_fold_contributions` also checks the invariant directly: two candidates of one merge that share a derivation key must agree on their fold input, since a derivation is evaluated once per iteration. If they differ, the key has failed to separate two derivations, and the merge returns an internal error instead of silently keeping one. The check is blind when the colliding rows carry equal fold inputs (e.g. `MSUM(1.0)` over two paths), which is why the discriminators themselves are the fix and the check is the tripwire.
+
 ### Post-FOLD WHERE (HAVING)
 
 A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`:
@@ -4021,6 +4076,42 @@ CREATE RULE frequent_payer AS
     WHERE n >= 3 AND total >= 100
     YIELD KEY p, n, total
 ```
+
+#### Seeding a fold
+
+A rule may seed a column in one clause and fold into it in another:
+
+```locy
+CREATE RULE f AS MATCH (e:E) WHERE e.uid IN ['x','y'] YIELD KEY e, 100.0 AS v
+CREATE RULE f AS MATCH (o:E)-[r:OWNS]->(e:E) WHERE o IS f FOLD v = MSUM(r.pct) YIELD KEY e, v
+```
+
+A FOLD aggregates, per KEY, **every** row of its rule: a folding clause
+contributes its aggregate's input and a seeding clause contributes the value it
+yields — SQL's `AGG(v) FROM (seeds UNION ALL inputs) GROUP BY key`. Measured:
+a seed of 100 plus an incoming stake of 20 is 120, recursive or not. For a
+count the same rule means a non-NULL seed is one counted row (its value is
+never read), and `NULL AS v` seeds a key without counting it. Because
+`YIELD KEY e, 0 AS n` beside `FOLD n = MCOUNT(r)` reads like a starting value,
+the compiler warns with `CountFoldSeedCounted`.
+
+Both kinds of row share the column, so both must carry one type:
+
+- a seeding clause projects the column with the fold's input type
+  (`fold_input_column_types`), so `0` feeds `MSUM(r.pct)` as `0.0`; the
+  self-reference's derived-scan schema uses the same types, rather than
+  inferring from whichever clause happens to be first;
+- a `COUNT` / `MCOUNT` input is projected as `CASE WHEN x IS NULL THEN NULL
+  ELSE 1 END` (`count_input_marker`), since a count only observes nullness.
+  Carrying the node or relationship itself put a `LargeBinary` or `UInt64`
+  column next to the seed's integer, and the merge failed with
+  `concatenate arrays of different data types`.
+
+#### What a FOLD clause may YIELD
+
+A FOLD emits one row per distinct KEY: the KEY columns plus one column per FOLD binding. `KEY` marks a **single** YIELD item, so a composite key is `YIELD KEY a, KEY b, total`; `YIELD KEY a, b, total` declares one KEY and a plain column `b`. A plain column has no single value per group, and `FoldExec` used to drop it without a diagnostic — a later `QUERY ... RETURN b` then read the absent column as NULL (issue #293). `check_fold_yield_is_grouped` now rejects, with `UngroupedFoldYield`, any YIELD item of a FOLD clause that is not a KEY, not a FOLD output, and does not mention one (`total * 2.0 AS score` is still allowed; the planner evaluates it after the fold). A clause *without* FOLD is unconstrained: a base clause `YIELD KEY e, 100.0 AS agg` seeds the column its sibling folds into.
+
+For the same reason a QUERY is checked against its rule's YIELD columns: `check_query_variables` rejects, with `UnknownQueryVariable`, a WHERE / RETURN / ORDER BY variable the rule does not yield (ORDER BY may also name a RETURN alias). The in-memory evaluator in `locy_query.rs` would otherwise return NULL for it on every row.
 
 The post-FOLD `WHERE` runs after all FOLD aggregates are computed and before BEST BY. It can reference FOLD output columns and KEY columns. Multiple conditions are combined with `AND`.
 
@@ -4856,6 +4947,29 @@ graph TB
 - **Within a transaction**: Sees its own uncommitted writes (Transaction L0) + all other visible data
 - **Outside a transaction**: Sees Current Main L0 + Pending Flush L0s + L1 Storage
 - **Snapshot reads**: See only the data as of a specific snapshot version
+
+### Every decision a scan makes must see L0 too
+
+A label scan larger than one slice is walked in half-open `_vid` ranges
+(`GraphScanExec`, #214), and each range reads flushed rows and the visible L0
+rows in that range. The walk also makes three decisions *about* the label, and
+each has to count L0 or it goes wrong in a way no range read can repair:
+
+- **Sizing** — whether to walk at all. `vertex_row_count` asks flushed storage;
+  `L0Context::vertex_count` adds the unflushed rows. Without it an all-L0 label
+  sized as empty and was built as one batch, and whether a query chunked
+  depended on whether a background flush had landed.
+- **End of walk** and **seek** — after an empty range, whether and where the
+  label continues. Vids are allocated across labels, so a label's newer rows
+  can sit beyond a block of another label's vids that its flushed rows never
+  reach. Asking flushed storage alone ended the walk inside that gap and
+  silently dropped every unflushed row above it (`MATCH (p:P) RETURN count(p)`
+  returned 9000 for 9007 rows). `L0Context::min_vertex_vid_at_or_above`
+  supplies the unflushed answer, and the walk resumes at the smaller of the two.
+
+The L0 answers are upper bounds or early resume points, never exclusions: a
+tombstoned or double-counted vertex only makes the walk look one range further,
+and the range read drops it.
 
 ## Write Throttling
 
@@ -5869,8 +5983,9 @@ graph TB
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `cache_size` | `usize` | 1 GB | Adjacency cache size in bytes |
-| `parallelism` | `usize` | CPU count | Worker threads for query execution |
-| `batch_size` | `usize` | 1,024 | Morsel size for DataFusion streaming |
+| `parallelism` | `usize` | CPU count | DataFusion `target_partitions` (partitions per plan) |
+| `batch_size` | `usize` | 1,024 | Rows per page a query cursor hands back; does not affect execution |
+| `execution_batch_size` | `Option<usize>` | `None` (8,192) | DataFusion `batch_size`: rows per batch inside the engine. Result-neutral; smaller values bound per-batch memory and LIMIT granularity at some throughput cost |
 | `max_frontier_size` | `usize` | 1,000,000 | Max vertices in traversal frontier |
 | `query_timeout` | `Duration` | 30s | Per-query timeout |
 | `max_query_memory` | `usize` | 1 GB | Per-query memory limit |
@@ -7055,6 +7170,267 @@ uv run ruff format .
 - **Always write test output to a file**: `cargo nextest run 2>&1 | tee /tmp/test_results.txt`
 - **Only re-run after code changes** that affect the tests
 - **Save baselines separately**: `/tmp/test_baseline.txt` and `/tmp/test_after_fix.txt` for comparison
+
+## Appendix B2: Correctness Invariants from the 2026-09 Class Audit
+
+A class audit (identity keys, partial views, unchecked shortcut preconditions;
+see `docs/proposals/correctness_class_harness_2026-09-28.md`) confirmed a set of
+silent wrong answers by comparing each suspect query with a differently
+formulated equivalent. Each fix states an invariant; each has a regression test
+under `crates/uni/tests/common/` that fails with the fix reverted.
+
+**Every decision about "which rows exist" consults L0 as well as storage.**
+- `StorageManager::existing_row_count(entity, &L0Context)` decides whether a
+  `NOT NULL` property can be declared strictly. Counting flushed tables alone
+  recorded `NOT NULL` over an all-L0 label, and every later flush failed on the
+  NULLs those rows carried (`bugs::not_null_on_unflushed_rows`).
+- The non-DETACH `DELETE` check adds the transaction's own edges
+  (`tx_incident_edges`); the adjacency overlay only receives them at commit
+  (`bugs::delete_sees_tx_local_edges`).
+- A vertex `UNIQUE` probe treats every layer's hit as a *candidate* and resolves
+  it to current values (`Writer::vertex_key_held`); vertex tables are
+  append-only and a deleted or moved key's row outlives its value. The L0
+  constraint index keeps a reverse map (`constraint_keys_by_vid`) so a `SET`
+  retires the vertex's previous key — the stale entry also tripped the
+  commit-time SSI guard (`bugs::unique_key_reuse`).
+- Full-text and vector search drop hits on superseded row versions
+  (`keep_latest_row_versions`), widening the search only when that left the
+  answer short, and an L0 update that removes a match overrides the flushed hit
+  (`bugs::fts_sees_current_text`).
+- An unlabelled `(n {ext_id: ...})` plans as the ordinary schemaless scan with
+  the equality pushed to the `ext_id` index; the retired dedicated lookup read
+  flushed rows only (`bugs::ext_id_lookup_sees_everything`).
+
+**A row's identity is the row, not the values it happens to bind.**
+- Rows entering an `OPTIONAL MATCH` carry an id (`OptionalSourceRowIdExec`,
+  `__optional_source_row_<k>`); the null-fill in the traversal and in
+  `OptionalFilterExec` groups by it. Grouping by bound node ids merged entering
+  rows that differed only in a scalar or repeated exactly, dropping NULL rows
+  (`bugs::optional_match_row_identity`). A clause with no rows entering it (a
+  leading `OPTIONAL MATCH`) is untagged and forms one group.
+- "No match → one NULL row" is decided once per entering row, over the whole
+  clause. A traversal's own null-fill is exact only for the step rows enter
+  by; past it one entering row is spread over several rows and batches, so each
+  dead end of `(a)-->(b)-->(c)` or `(a)-->(b), (b)-->(c)` emitted a NULL row, a
+  second comma-separated path extended rows the first had failed (returning a
+  value where NULL was due), and a leading clause emitted one NULL row per
+  batch. An OPTIONAL clause of more than one step now ends in an
+  `OptionalFilterExec` (predicate `true` when it has no WHERE). A row passes it
+  only if every identity column the clause created (`._vid`, `._eid`,
+  `__eid_to_*`, `_hop_count`; "created" = not in the tagging operator's output)
+  is non-null, and the NULL row it emits nulls every created column. The
+  optional variable set of a clause's later paths includes its earlier paths'
+  variables, so a second path does not re-tag rows. VLP `_hop_count` is NULL
+  on carrier rows: an anonymous relationship into a bound node creates no other
+  identity column. Found by running the Cypher TCK at an execution batch size
+  of 1 (`Graph6[6]`), then mapped with an oracle — `MATCH (a) OPTIONAL MATCH p`
+  ≡ `MATCH (a) MATCH p` ⊎ `MATCH (a) WHERE NOT EXISTS { MATCH p }` padded with
+  NULL (`bugs::optional_match_clause_close`).
+- Mutually recursive Locy rules keep their own facts: `FixpointExec` exposes
+  each rule's output (`per_rule_output`), and a stratum's rules are sorted so
+  their order is the same on every run (`locy::locy_mutual_recursion_per_rule_facts`).
+
+**Relationship uniqueness spans the whole pattern, in every direction.**
+- A relationship *after* a variable-length one excludes that one's edges. The
+  traversal operators exclude used edges from `._eid` / `__eid_to_*` columns
+  and, now, from a variable-length step variable's `List<Edge>` column
+  (`UsedEdgeIds`, `collect_used_edge_columns`); an anonymous variable-length
+  relationship in a clause with another relationship is given a hidden
+  `_anon_N` step variable so it has one (`name_anonymous_variable_length`),
+  which also keeps it off the reachability path. Before, a fixed hop after
+  `-[*1..2]-` could walk back along an edge the variable-length hop had
+  used: 221 rows where brute force gives 104 (`bugs::vlp_relationship_uniqueness`).
+- The reachability BFS (`bfs_endpoints_only`, used under `DISTINCT`/`EXISTS`)
+  checks trail validity only after every predecessor at a depth is recorded.
+  Checking at first discovery dropped an endpoint whose first-found
+  predecessor reused an edge, in an order that varied run to run
+  (`bugs::reachability_trail_any_predecessor`).
+
+**A chunked operator decides per-input-row facts over the whole input
+batch.** `GraphTraverseExec` emits a large expansion set in
+`batch_size` chunks; its OPTIONAL NULL rows are now built once, after the last
+chunk, from the full set of matched rows. Built per chunk, every row whose
+matches fell in another chunk got a NULL row per chunk — at the default batch
+size, once one input batch expands past 8192 rows (`bugs::optional_traverse_chunked`).
+
+**An entity that is absent is NULL, not a struct of NULLs.** A node or
+relationship variable is materialized as a `named_struct` of its flattened
+columns (`add_structural_projection`, `add_edge_structural_projection`), and
+`named_struct` is never NULL. Each is now guarded by
+`absent_entity_is_null` (`CASE WHEN <var>._vid|_eid IS NOT NULL THEN … END`).
+Unguarded, an OPTIONAL MATCH miss made `labels(b)` fail, `keys(b)` return
+`[]`, `keys(r)` return the declared property names, and `[b, 1]` / `{k: b}`
+collapse to NULL; a labelled target hid it because its filter re-nulled the
+column (`bugs::optional_entity_is_null`).
+
+**An expression with its own scope carries its outer columns with it.** A
+list comprehension, quantifier, `reduce` or pattern comprehension compiles its
+body against the input schema plus its own variables and keeps the body out of
+`children()`. DataFusion's `CASE` evaluates each branch on a batch projected
+down to the columns its children reference, renumbered — so a hidden body read
+columns that were gone or had moved: an error, or (a pattern comprehension
+whose anchor was dropped) an empty result per row. Each now exposes the outer
+columns its body reads (`common::outer_column_refs`) and realigns the batch to
+its compiled layout by name before building the inner batch
+(`common::realign_by_name`) (`bugs::nested_scope_in_case_branch`).
+
+**Types are decided where the values are.**
+- `reduce` stays typed only when the list's element type is known and the
+  body returns the accumulator's type; otherwise accumulator, elements and body
+  are Cypher values (`ToCypherValueExpr`). Decoding an untyped list *as the
+  accumulator's type* truncated floats (`reduce(s = 0, v IN [1.5, 2.5] | s +
+  v)` returned 3), and a `null` start panicked in Arrow
+  (`bugs::reduce_accumulator_types`).
+- `cv_array_to_large_list` declares the list's item type from the values it
+  built, not from the type asked for.
+- A binary operator compiled outside the logical path (an operand holding a
+  custom expression) casts its operands to the types DataFusion's own
+  `BinaryTypeCoercer` picks; `size([x IN xs | x]) * 1.5` failed.
+- `CASE` casts a `Null`-typed branch to the other branches' type, and converts
+  every branch to a Cypher value when any branch is one.
+- `elementId(n)` reads the identity column as `id(n)` does; it had failed to
+  plan on every MATCH-bound variable (`bugs::element_id_of_bound_variables`).
+
+**`sum` over no non-null value is 0**, as in Cypher (Neo4j), not NULL as in
+SQL. DataFusion's `sum` result is wrapped in `CASE WHEN … IS NULL THEN 0`
+(a zero of its type) in `plan_aggregate`'s renaming projection
+(`sum_of_nothing_is_zero`); `CypherSumAccumulator` returns `Int(0)`; the row
+executor's `Accumulator::Sum` already did. A `sum(...) OVER` window gets the
+same wrap in `plan_window_functions`, and sums a float argument as Float64
+(it had cast every argument to Int64, truncating each float before adding).
+`min`/`max`/`avg` of nothing stay NULL (`bugs::sum_of_nothing_is_zero`).
+
+**An entity map is recognised by structure, never by an id key alone.**
+`entity_ref_from_map` is the one definition: a vertex needs `_labels` (every
+vertex encoding carries it), an edge a type (`_type`, `_type_name`,
+`edge_type`), both endpoints, or an edge id with an endpoint. Recognising any
+map with `_id`/`_vid`/`vid`/`_eid` made `{_id: 0, x: 1} = {_id: 0, x: 2}`
+true, collapsed such maps in `collect(DISTINCT)`, and turned them into nodes
+under `UNWIND`/`RETURN`. `ResultNormalizer::is_node_map`/`is_edge_map` defer
+to it. `collect(DISTINCT)` keys values structurally (entities by identity,
+scalars by their codec bytes), not by display string
+(`bugs::user_maps_are_not_entities`).
+
+**A projection rebinds its aliases.** `WITH b AS a` carries `b`'s flattened
+columns as `a.*` (`carry_entity_columns`), and `collect_variable_kinds` /
+`collect_variable_labels` rebind `a` to `b`'s kind and label (a computed alias
+becomes opaque), as `UNWIND` already did. Carried under the source name, a
+swap `WITH b AS a, a AS b` filtered on the old `a` — silently wrong — and a
+rename onto a used name failed to plan. `reconcile_passthrough_properties`
+folds an alias's property reads onto every variable up its rename chain, not
+just the first: `WITH n AS a WITH a AS x RETURN x.id` on an unlabelled node
+loaded only the `_all_props` blob and compiled `x.id` to NULL
+(`bugs::with_rebinds_entity_names`).
+
+**Locy keeps Cypher's semantics where the two overlap** (W4, found by the
+Locy↔Cypher relations of `metamorphic::dqp::topo`):
+- A derived fact is a row: a non-recursive rule's facts pass through
+  `dedup_fact_rows` (the fixpoint's own `RowDedupState` / scalar-key dedup)
+  after its post-fixpoint chain. Only the recursive path deduplicated, so
+  parallel edges derived one fact per edge (`locy::locy_facts_and_filters`).
+  A rule with ALONG is the exception (`facts_are_per_path`): its facts are
+  one row per path (#159), as the recursive path keeps them through its
+  hidden derivation columns, so equal-valued paths stay distinct. Deduplicating
+  it collapsed two parallel equal-valued edges and halved a downstream SUM.
+- `QUERY ... WHERE` (the in-memory `locy_eval`) uses three-valued logic: a
+  comparison with NULL is NULL and `AND`/`OR` are Kleene. `NULL <> x` was
+  true, so a filter kept rows a rule-body WHERE rejects.
+- `SUM` / `MSUM` of nothing is 0.0, matching Cypher's `sum`.
+- `infer_yield_type_rec` types `MIN`/`MAX`/`MMIN`/`MMAX` by their argument
+  (`fold_argument_type`), does not cast `COLLECT`'s input, and types a
+  property of an unlabelled node or a relationship from the schema when every
+  declaration agrees (`uniform_declared_type`), and leaves a property declared
+  nowhere (schemaless) as the stored Cypher value; everything was Float64, so
+  integers came back as floats and lost precision above 2^53
+  (`locy::locy_value_types`).
+- A Locy rule body is planned by `plan_pattern_scoped`, which now names
+  anonymous variable-length relationships as `plan_match_clause` does, so
+  relationship uniqueness holds there too.
+
+**A condition that cannot be evaluated is an error, not a dropped row** (W6).
+Every Locy filter goes through `locy_eval::eval_condition`: true keeps the
+row, false and NULL drop it, and an evaluation error or a non-boolean is a
+`LocyError`. That covers `QUERY`, `DERIVE`, `ABDUCE` and `EXPLAIN RULE`
+`WHERE`, and a rule body's target-dependent conditions on the SLG path; each
+had mapped both to "drop the row", so `DERIVE` wrote fewer facts and `ABDUCE`
+reported a conclusion that no longer held. In the same evaluator, `<`, `<=`,
+`>`, `>=` between types with no order (`1 < 'x'`) are NULL, not false
+(`compare`/`ordering`); `^` of a non-number is a type error, not `0.0`;
+`QUERY ... ORDER BY` evaluates its keys on the row before projection, with
+the returned aliases over it, and propagates errors. It evaluated them on the
+projected row, so `ORDER BY a.age` read a missing column, every key became
+NULL, and the clause did nothing. The SLG goal binding compares by
+`values_equal`, and is injected into the body only for a key yielded as a bare
+variable; an aliased key (`YIELD KEY n.k AS k`) is checked after projection.
+On the Cypher side `_cv_to_bool` reads an encoded NULL as NULL and a
+non-boolean as a type error; both read as `false`, so `NOT n.b` kept a row
+whose `b` is `1`. `CypherPhysicalExprCompiler::compile_predicate` wraps a
+CypherValue `WHERE`, and `compile_binary_op` wraps CypherValue AND/OR
+operands, in `_cv_to_bool`. Before, `WHERE n.b` on a schemaless property failed
+to plan. A list slice bound that is not an integer is a type error. In debug
+builds `debug_assert_facts_are_rows` checks that every non-ALONG rule's facts
+entering the derived store are distinct rows (`locy::locy_facts_and_filters`,
+`bugs::boolean_context_is_strict`, `locy::locy_generator_plugin`).
+
+**Locy and Cypher answer alike where they overlap (W4/W5 completion).**
+A `QUERY ... RETURN` that aggregates groups by its non-aggregate items, as
+Cypher's RETURN does (`aggregate_return` in `locy_query.rs`; an aggregate in
+ORDER BY needs one in the RETURN), and `SKIP`/`LIMIT` take any expression
+over the parameters. Locy `/` and `%` error only for integer zero (a float
+zero gives IEEE Infinity/NaN), and `toInteger`/`toFloat` of an unparsable
+string is NULL. A rule-body condition list may join an expression to an
+IS-reference with `AND` (`rule_and_condition` in `locy.pest`). A label
+disjunction `n:A|B` is an expression (`label_predicate` in the walker, lowered
+to `n:A OR n:B`). A map compared with another concrete type is answered
+without comparing (`is_map_vs_other`). ALONG columns take the type unified
+over the rule's clauses (`along_column_types`), and a Locy aggregate reads a
+numeric CypherValue cell (`numeric_at`). `snapshot_reads` counts edge and
+main-vertex scans of a pinned session too.
+
+**A storage projection names each column once.** The property fetch drops
+repeated names (`retain_first_occurrences`); a repeated equality on a
+variable-length target listed `id` twice and Lance rejected the scan
+(`bugs::duplicate_property_projection`).
+
+**A scan walks every slice, whatever its gaps.** DQP `Tier::Wide` puts
+`Person` in three chunks with `Company` chunks between them, over more than one
+8192-row scan slice, then a 65 536-row `Filler` block, so the flush lever's L0
+delta sits past a gap wider than the range walk grows to; `flush_wide_smoke`
+fails on its first case with the scan-range fix (`0993d4f68`) reversed.
+
+All of these were found by the query-rewrite relations of
+`metamorphic::dqp::topo` (W3), which hold data and engine fixed and compare a
+query with equivalent formulations over a fixture with parallel edges,
+self-loops, cycles and a diamond; every reference query also runs twice.
+
+**A fast path takes only inputs whose every feature it implements.**
+- The vectorized pattern predicate and pattern comprehension pass
+  `fast_path_unsupported` first: anchor constraints, relationship property maps
+  or inline WHERE, overlapping relationship types across hops (uniqueness),
+  variable-length ranges and multi-label nodes go to the correlated subquery
+  instead. A bound node after the anchor is renamed and tested by id
+  (`rebind_bound_later_nodes`). Labels on an outer-bound node in a correlated
+  subquery are tested against `$<var>._labels`, supplied from the node's id
+  (`bugs::pattern_fast_path_constraints`).
+- `LabelExpr` derefs to its bare names, so anything taking `&[String]` loses
+  AND/OR. `node_filter_expr` takes `&LabelExpr`; a disjunctive traversal target
+  carries no single label id; a quantified pattern's inner node with more than
+  one label is refused (`bugs::label_disjunction_on_traversal_target`).
+- Inline element predicates `(m WHERE ...)` / `[r WHERE ...]` are ANDed into the
+  clause's WHERE (and into Locy rule bodies); nothing applied them before. On a
+  variable-length or quantified element they are refused, since they would
+  apply per edge (`bugs::inline_element_where`).
+
+**Locy fixpoint rounding applies to keys, not values.** Dedup and
+change detection compare `float_key_view` — every Float64 rounded to an
+absolute 1e-12 — so noise from evaluation order compares equal and a value
+decaying around a cycle converges to 0; the facts keep their exact values. The
+rounding used to be applied to the stored rows, which turned every magnitude
+below 1e-12 into 0 (an ALONG product of 1e-7 × 1e-7 was stored as 0.0). A
+purely relative rounding was tried first and broke convergence on cyclic
+`MPROD` folds (`issue_162_cyclic_recursive_fold_terminates`). The hash anti-join
+path compares the key view with a candidate row index carried outside the join
+keys, and maps the survivors back to exact rows.
 
 ## Appendix C: Anti-Pattern Summary
 

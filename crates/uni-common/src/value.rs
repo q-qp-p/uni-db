@@ -2090,10 +2090,17 @@ pub fn entity_ref_from_map(map: &HashMap<String, Value>) -> Option<EntityRef> {
         }
     }
 
-    // An explicit `_eid`/`_vid` settles it on its own; `_id` needs the
-    // structural tell, since both encodings spell it that way.
-    let looks_like_edge = map.contains_key("_eid")
-        || map.contains_key("eid")
+    // An entity is recognised by a structural tell, never by an id key alone:
+    // a user map may well have an `_id`, `_eid` or `vid` key. Every edge
+    // encoding the engine produces carries a type (`_type`, `_type_name`,
+    // `edge_type`) or both endpoints; every vertex encoding carries `_labels`.
+    let has_endpoint = ["_src", "_dst", "src", "dst", "_src_vid", "_dst_vid"]
+        .iter()
+        .any(|k| map.contains_key(*k));
+    let looks_like_edge = map.contains_key("_type")
+        // An explicit edge id with at least one endpoint: a row decoder may
+        // carry only one of them (`edge_endpoints` treats each as optional).
+        || ((map.contains_key("_eid") || map.contains_key("eid")) && has_endpoint)
         || ((map.contains_key("_src") || map.contains_key("src"))
             && (map.contains_key("_dst") || map.contains_key("dst")))
         // Locy's row decoder spells the endpoints `_src_vid` / `_dst_vid`. An
@@ -2107,10 +2114,20 @@ pub fn entity_ref_from_map(map: &HashMap<String, Value>) -> Option<EntityRef> {
         get_with_fallback(map, &["_eid", "_id", "eid"])
             .and_then(id_from)
             .map(|id| EntityRef::Edge(Eid::from(id)))
-    } else {
+    } else if map.contains_key("_labels") {
+        // Every vertex encoding the engine produces carries `_labels`: the
+        // planner's entity struct (`_vid`, `_labels`, properties) and the serde
+        // form (`_id`, `_labels`, `properties`). Without that tell, a user's map
+        // that merely has an `_id`, `_vid` or `vid` key — `{_id: 0, x: 1}`, or
+        // `properties(n)` of a node with an `_id` property — was read as vertex
+        // 0 with its other keys ignored: `{_id: 0, x: 1} = {_id: 0, x: 2}` was
+        // true, `collect(DISTINCT ...)` merged such maps, and `UNWIND` turned
+        // them into nodes.
         get_with_fallback(map, &["_vid", "_id", "vid"])
             .and_then(id_from)
             .map(|id| EntityRef::Vertex(Vid::from(id)))
+    } else {
+        None
     }
 }
 

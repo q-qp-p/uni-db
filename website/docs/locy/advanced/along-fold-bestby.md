@@ -24,6 +24,44 @@ FOLD total = SUM(b.value)
 YIELD KEY a, total
 ```
 
+### What a FOLD rule can YIELD
+
+A FOLD produces one row per distinct KEY. `KEY` marks a single YIELD item, so
+to group by several columns mark each one:
+
+```locy
+CREATE RULE stake AS
+MATCH (o)-[r:OWNS]->(e)
+FOLD pct = MAX(r.pct)
+YIELD KEY o, KEY e, pct      // one row per (o, e)
+```
+
+`YIELD KEY o, e, pct` means something else: `o` is the only KEY and `e` is a
+plain column. A plain column has no single value per group, so the compiler
+rejects it. Every non-KEY item of a FOLD clause must be a FOLD output or an
+expression over one (`pct * 100.0 AS percent`).
+
+Likewise, a `QUERY` may only reference columns its rule yields; `QUERY stake
+RETURN e.uid` against a rule that does not yield `e` is a compile error, not a
+column of NULLs.
+
+### Seeding a fold
+
+A rule can give some keys a starting row in one clause and fold into the same
+column in another. The fold aggregates **all** of the rule's rows for a key, so
+the seed is one more input:
+
+```locy
+CREATE RULE f AS MATCH (e:E) WHERE e.uid IN ['x','y'] YIELD KEY e, 100.0 AS v
+CREATE RULE f AS MATCH (o:E)-[r:OWNS]->(e:E) WHERE o IS f
+FOLD v = MSUM(r.pct) YIELD KEY e, v
+```
+
+A key seeded with 100 that also receives a stake of 20 comes out as 120. For
+`COUNT` / `MCOUNT` a seed is one counted row — `0 AS n` makes a key with no
+other rows count **1**, and the compiler warns about it. Seed with `NULL AS n`
+to make a key present without counting it.
+
 ### FOLD in a recursive rule
 
 A recursive `FOLD` rolls up **per KEY, one level at a time**: a self-reference
@@ -44,6 +82,11 @@ YIELD KEY p, b
 
 For `TOP → MID → {L1, L2}` with both leaves at 0.5, `MID` is `0.25` and `TOP`
 folds that single value, so `TOP` is `0.25` too.
+
+Every derivation counts once, including ones that differ only in the edge or
+path they went through: two parallel `OWNS` edges from `x` to `a`, or two
+distinct paths matched by a variable-length relationship, are two
+contributions to `a`'s fold, exactly as in a non-recursive rule.
 
 `ALONG` is the per-path alternative, and it wins on its own clause: a clause
 carrying `ALONG` reads the pre-fold rows, because `prev.<field>` accumulates

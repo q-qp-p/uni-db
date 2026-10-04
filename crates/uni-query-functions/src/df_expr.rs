@@ -2182,6 +2182,29 @@ fn translate_graph_function(
     context: Option<&TranslationContext>,
 ) -> Option<Result<DfExpr>> {
     match name_upper {
+        // `elementId(n)` is `id(n)` as a string. It is registered as needing
+        // only the entity's identity, so the entity itself is never
+        // materialized as a column — and handed the whole entity, every call
+        // on a scan- or traversal-bound variable failed with "No field named
+        // n". Read the identity column instead, as `id` does. Anything else
+        // takes the generic path, which decodes an encoded entity.
+        "ELEMENTID" => {
+            let Some(Expr::Variable(var)) = args.first() else {
+                return None;
+            };
+            let kind = context.and_then(|ctx| ctx.variable_kinds.get(var))?;
+            let id_suffix = match kind {
+                VariableKind::Node => COL_VID,
+                VariableKind::Edge => COL_EID,
+                _ => return None,
+            };
+            Some(Ok(DfExpr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(DfExpr::Column(Column::from_name(format!(
+                    "{var}.{id_suffix}"
+                )))),
+                datafusion::arrow::datatypes::DataType::Utf8,
+            ))))
+        }
         "ID" => {
             // When called with a bare variable (ID(n)), rewrite to the internal
             // identity column reference (_vid for nodes, _eid for edges).
@@ -3219,7 +3242,49 @@ fn coerce_mismatched_types(
         }
     }
 
+    if is_comparison && is_map_vs_other(left_type, right_type) {
+        let null = lit(ScalarValue::Boolean(None));
+        return match op {
+            Operator::Eq | Operator::NotEq => Some(
+                datafusion::logical_expr::when(left.is_null().or(right.is_null()), null)
+                    .otherwise(lit(op == Operator::NotEq))
+                    .map_err(|e| anyhow!("{e}")),
+            ),
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => Some(Ok(null)),
+            _ => None,
+        };
+    }
+
     None
+}
+
+/// Whether a comparison sets a map (an Arrow struct) against a value of another
+/// concrete type, which openCypher answers without comparing: `<`, `<=`, `>`,
+/// `>=` are NULL, `=` is false and `<>` true (NULL if either side is NULL).
+/// DataFusion has no common type for the pair, so `1 < {k: 1}` failed to plan
+/// and `a.id <= {k: 1}` failed at run time ("Nested comparison").
+///
+/// A dynamically typed (CypherValue) or untyped NULL side is not decided here,
+/// nor is a node or relationship (an entity struct).
+pub fn is_map_vs_other(
+    left: &datafusion::arrow::datatypes::DataType,
+    right: &datafusion::arrow::datatypes::DataType,
+) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    // A node or relationship is a struct too, but comparing one to a literal
+    // stays a planning error (`entity_comparison_test`).
+    let is_map = |t: &DataType| match t {
+        DataType::Struct(fields) => !fields
+            .iter()
+            .any(|f| matches!(f.name().as_str(), "_vid" | "_eid")),
+        _ => false,
+    };
+    let is_entity = |t: &DataType| matches!(t, DataType::Struct(_)) && !is_map(t);
+    if is_entity(left) || is_entity(right) {
+        return false;
+    }
+    let concrete = |t: &DataType| !matches!(t, DataType::Null | DataType::LargeBinary);
+    is_map(left) != is_map(right) && concrete(left) && concrete(right)
 }
 
 /// Handle list comparisons: ordering via UDF and equality via _cypher_equal/_cypher_not_equal.

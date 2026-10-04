@@ -32,6 +32,9 @@ pub struct ReduceExecExpr {
     input_schema: Arc<Schema>,
     /// Output data type (type of reduce_expr)
     output_type: DataType,
+    /// Outer columns `reduce_expr` reads, exposed as children so a projection
+    /// above keeps them (see `common::outer_column_refs`).
+    outer_refs: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl ReduceExecExpr {
@@ -44,6 +47,11 @@ impl ReduceExecExpr {
         input_schema: Arc<Schema>,
         output_type: DataType,
     ) -> Self {
+        let outer_refs = super::common::outer_column_refs(
+            &[&reduce_expr],
+            &input_schema,
+            &[&accumulator_name, &variable_name],
+        );
         Self {
             accumulator_name,
             initial_expr,
@@ -52,6 +60,7 @@ impl ReduceExecExpr {
             reduce_expr,
             input_schema,
             output_type,
+            outer_refs,
         }
     }
 }
@@ -114,14 +123,14 @@ impl PhysicalExpr for ReduceExecExpr {
         let list_val = self.list_expr.evaluate(batch)?;
         let list_array = list_val.into_array(batch.num_rows())?;
 
-        // Decode CypherValue-encoded arrays (LargeBinary → LargeList<element_type>)
-        // Use the accumulator type as the target element type since the reduce body
-        // was compiled expecting elements to match the accumulator type.
+        // Decode CypherValue-encoded arrays (LargeBinary → LargeList<LargeBinary>).
+        // An untyped list's elements stay Cypher values: the body was compiled
+        // for that (`compile_reduce`), and decoding them as any narrower type
+        // would coerce them — as the accumulator's type, floats became integers.
         let list_array = if let DataType::LargeBinary = list_array.data_type() {
-            let element_type = self.output_type.clone();
             crate::query::df_graph::common::cv_array_to_large_list(
                 list_array.as_ref(),
-                &element_type,
+                &DataType::LargeBinary,
             )?
         } else {
             list_array
@@ -150,6 +159,11 @@ impl PhysicalExpr for ReduceExecExpr {
         // 2. Evaluate initial value -> current accumulator
         let init_val = self.initial_expr.evaluate(batch)?;
         let mut current_acc = init_val.into_array(batch.num_rows())?;
+
+        // The list and initial value are children, so a projection above
+        // renumbered them for this batch; the body was not, and reads the
+        // input by its compiled layout.
+        let batch = &super::common::realign_by_name(batch, &self.input_schema)?;
 
         // 3. Layer-by-layer evaluation
         // Find max length
@@ -271,17 +285,20 @@ impl PhysicalExpr for ReduceExecExpr {
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         // Only expose expressions compiled against the outer schema.
         // reduce_expr is compiled against an inner schema (with loop variable and accumulator)
-        // and should not be exposed to DataFusion's expression tree traversal.
-        vec![&self.initial_expr, &self.list_expr]
+        // and should not be exposed to DataFusion's expression tree traversal;
+        // the outer columns it reads are, so they are not projected away.
+        let mut children = vec![&self.initial_expr, &self.list_expr];
+        children.extend(self.outer_refs.iter());
+        children
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        if children.len() != 2 {
+        if children.len() != 2 + self.outer_refs.len() {
             return Err(datafusion::error::DataFusionError::Internal(
-                "Reduce requires 2 children (initial_expr, list_expr)".to_string(),
+                "Reduce requires its initial_expr, list_expr and outer column children".to_string(),
             ));
         }
         Ok(Arc::new(Self {
@@ -292,6 +309,7 @@ impl PhysicalExpr for ReduceExecExpr {
             variable_name: self.variable_name.clone(),
             input_schema: self.input_schema.clone(),
             output_type: self.output_type.clone(),
+            outer_refs: children[2..].to_vec(),
         }))
     }
 

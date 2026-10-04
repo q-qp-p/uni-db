@@ -88,7 +88,14 @@ impl ResultNormalizer {
     /// Detection is intentionally lenient for top-level result values. Property values
     /// inside nodes/edges use `normalize_property_value` instead, which skips this check.
     fn is_node_map(map: &HashMap<String, Value>) -> bool {
-        map.contains_key("_vid") || (map.contains_key("_id") && map.contains_key("label"))
+        // The one definition of "this map is an entity" (`entity_ref_from_map`),
+        // which `map_to_node` also requires. A looser gate here sent a user map
+        // with a `_vid` key into `map_to_node`, which then failed and the value
+        // came back NULL.
+        matches!(
+            uni_common::value::entity_ref_from_map(map),
+            Some(uni_common::value::EntityRef::Vertex(_))
+        )
     }
 
     /// Check if map represents an edge.
@@ -96,8 +103,10 @@ impl ResultNormalizer {
     /// Detection is intentionally lenient for top-level result values. Property values
     /// inside nodes/edges use `normalize_property_value` instead, which skips this check.
     fn is_edge_map(map: &HashMap<String, Value>) -> bool {
-        map.contains_key("_eid")
-            || (map.contains_key("_id") && map.contains_key("_src") && map.contains_key("_dst"))
+        matches!(
+            uni_common::value::entity_ref_from_map(map),
+            Some(uni_common::value::EntityRef::Edge(_))
+        )
     }
 
     /// Check if map represents a path (has "nodes" and "relationships" or "edges").
@@ -499,10 +508,11 @@ mod tests {
 
     #[test]
     fn test_map_with_vid_at_top_level_becomes_node() {
-        // At top level, a map with _vid is detected as a node
-        // (even without _labels - labels defaults to empty vec)
+        // At top level, an entity map — `_vid` with `_labels`, the shape every
+        // vertex encoding carries — is converted to a node.
         let mut map = HashMap::new();
         map.insert("_vid".to_string(), Value::Int(123));
+        map.insert("_labels".to_string(), Value::List(vec![]));
         map.insert("name".to_string(), Value::String("test".to_string()));
 
         let result = ResultNormalizer::normalize_value(Value::Map(map)).unwrap();
@@ -518,6 +528,19 @@ mod tests {
             }
             _ => panic!("Expected Node variant, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn test_user_map_with_vid_key_stays_a_map() {
+        // A map with an `_vid` key but no `_labels` is the user's data, not a
+        // node: converting it dropped its other keys' meaning and, once the
+        // entity test was tightened, made the value NULL.
+        let mut map = HashMap::new();
+        map.insert("_vid".to_string(), Value::Int(123));
+        map.insert("name".to_string(), Value::String("test".to_string()));
+
+        let result = ResultNormalizer::normalize_value(Value::Map(map.clone())).unwrap();
+        assert_eq!(result, Value::Map(map));
     }
 
     #[test]

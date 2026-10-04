@@ -1533,10 +1533,11 @@ mod tests {
         let field = Field::new("n", DataType::LargeBinary, true).with_metadata(metadata);
         let schema = Arc::new(Schema::new(vec![field]));
 
-        // Create a node-like Map value
+        // A node's entity map, as the engine encodes one (`_vid` and `_labels`).
         let mut node_map = HashMap::new();
         node_map.insert("name".to_string(), Value::String("Alice".into()));
         node_map.insert("_vid".to_string(), Value::Int(1));
+        node_map.insert("_labels".to_string(), Value::List(vec![]));
         let map_val = Value::Map(node_map);
 
         // Encode to CypherValue bytes

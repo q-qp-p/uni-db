@@ -182,6 +182,15 @@ pub const DEFAULT_DATA_SEED: u64 = 0x5EED_D9F_u64.wrapping_mul(0x9E37_79B9);
 /// lever would soak a path that cannot exhibit the defect — passing green.
 pub const INDEXED_PROPERTY: &str = crate::querygen::PUSHDOWN_PROPERTY;
 
+/// A label no generated query names. [`Tier::Wide`] inserts a block of it
+/// after the persons so the rows a lever later adds sit above a vid gap wider
+/// than a scan's range walk grows to; the other tiers insert none.
+pub const FILLER_LABEL: &str = "Filler";
+
+/// Filler rows [`Tier::Wide`] inserts: wider than the range a chunked scan has
+/// doubled to by the time it reaches the gap (the regression needed 60 000).
+const WIDE_FILLER_ROWS: usize = 65_536;
+
 /// Fixture size class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
@@ -193,6 +202,16 @@ pub enum Tier {
     /// scans. Properties of the *data*, which a few hundred cases exercise as
     /// well as fifty thousand do.
     Large,
+    /// ~9k `Person` rows inserted in three chunks with `Company` chunks between
+    /// them, then a 65 536-row block of [`FILLER_LABEL`], so `Person` spans
+    /// more than one 8192-row scan slice, its vids have gaps, and anything a
+    /// lever adds later sits above a wide one. That is the layout a chunked
+    /// scan's range walk got wrong: it sized and ended its walk from flushed
+    /// rows only and dropped unflushed rows past a gap (9 000 of 9 007
+    /// returned). Every smaller tier has one slice per label and contiguous
+    /// vids, so no lever over them could see it. A layout variant rather than a
+    /// size class, so not in [`Tier::ALL`].
+    Wide,
 }
 
 impl Tier {
@@ -205,6 +224,7 @@ impl Tier {
             Tier::Tiny => "tiny",
             Tier::Smoke => "smoke",
             Tier::Large => "large",
+            Tier::Wide => "wide",
         }
     }
 
@@ -214,6 +234,7 @@ impl Tier {
             Tier::Tiny => 1_000,
             Tier::Smoke => 10_000,
             Tier::Large => 50_000,
+            Tier::Wide => 9_000,
         }
     }
 
@@ -224,6 +245,7 @@ impl Tier {
             Tier::Tiny => 40,
             Tier::Smoke => 400,
             Tier::Large => 2_000,
+            Tier::Wide => 360,
         }
     }
 
@@ -233,7 +255,7 @@ impl Tier {
     /// and Phase 0A measured that two thirds of ordinary draws are unfiltered.
     /// See `querygen::arb_case_selective`.
     pub fn needs_selectivity_floor(self) -> bool {
-        matches!(self, Tier::Smoke | Tier::Large)
+        matches!(self, Tier::Smoke | Tier::Large | Tier::Wide)
     }
 
     /// Number of `WORKS_AT` edges (~4 per non-edgeless Person).
@@ -242,6 +264,17 @@ impl Tier {
             Tier::Tiny => 4_000,
             Tier::Smoke => 40_000,
             Tier::Large => 200_000,
+            Tier::Wide => 36_000,
+        }
+    }
+
+    /// How many chunks each label is inserted in, alternating labels. One chunk
+    /// keeps a label's vids contiguous; more puts the other label's vids
+    /// between them.
+    fn insert_chunks(self) -> usize {
+        match self {
+            Tier::Wide => 3,
+            Tier::Tiny | Tier::Smoke | Tier::Large => 1,
         }
     }
 }
@@ -344,6 +377,8 @@ async fn apply_schema(db: &Uni, mode: SchemaMode) -> anyhow::Result<()> {
         .property_nullable("founded", DataType::Int)
         .done()
         .edge_type("WORKS_AT", &["Person"], &["Company"])
+        .label(FILLER_LABEL)
+        .done()
         .apply()
         .await?;
     Ok(())
@@ -401,14 +436,15 @@ fn company_batch(range: std::ops::Range<usize>, rng: &mut Rng) -> Vec<HashMap<St
 async fn insert_vertices<F>(
     db: &Uni,
     label: &str,
-    total: usize,
+    rows: std::ops::Range<usize>,
     mut build: F,
 ) -> anyhow::Result<Vec<Vid>>
 where
     F: FnMut(std::ops::Range<usize>) -> Vec<HashMap<String, Value>>,
 {
-    let mut vids = Vec::with_capacity(total);
-    let mut start = 0;
+    let mut vids = Vec::with_capacity(rows.len());
+    let total = rows.end;
+    let mut start = rows.start;
     while start < total {
         let end = (start + VERTEX_BATCH).min(total);
         let props = build(start..end);
@@ -496,15 +532,36 @@ where
     let db = Uni::temporary().config(config).build().await?;
     apply_schema(&db, f.mode).await?;
 
-    let mut rng = Rng::new(seed | 1);
-    let person_vids =
-        insert_vertices(&db, "Person", tier.persons(), |r| person_batch(r, &mut rng)).await?;
+    // Labels alternate chunk by chunk, so with more than one chunk each label's
+    // vids have the other label's between them. Each label keeps its own RNG
+    // stream, so a one-chunk tier is byte-identical to the unchunked build.
+    let mut person_rng = Rng::new(seed | 1);
+    let mut company_rng = Rng::new(seed.rotate_left(17) | 1);
+    let chunks = tier.insert_chunks();
+    let mut person_vids = Vec::with_capacity(tier.persons());
+    let mut company_vids = Vec::with_capacity(tier.companies());
+    for chunk in 0..chunks {
+        let rows = |total: usize| total * chunk / chunks..total * (chunk + 1) / chunks;
+        person_vids.extend(
+            insert_vertices(&db, "Person", rows(tier.persons()), |r| {
+                person_batch(r, &mut person_rng)
+            })
+            .await?,
+        );
+        company_vids.extend(
+            insert_vertices(&db, "Company", rows(tier.companies()), |r| {
+                company_batch(r, &mut company_rng)
+            })
+            .await?,
+        );
+    }
 
-    let mut rng = Rng::new(seed.rotate_left(17) | 1);
-    let company_vids = insert_vertices(&db, "Company", tier.companies(), |r| {
-        company_batch(r, &mut rng)
-    })
-    .await?;
+    if tier == Tier::Wide {
+        insert_vertices(&db, FILLER_LABEL, 0..WIDE_FILLER_ROWS, |r| {
+            r.map(|_| HashMap::new()).collect()
+        })
+        .await?;
+    }
 
     // Persons eligible for edges — every EDGELESS_EVERY-th is skipped so
     // relationship patterns legitimately drop rows.

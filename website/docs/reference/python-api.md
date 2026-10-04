@@ -175,7 +175,7 @@ Fluent builder for advanced database configuration. Exposed as `uni_db.UniBuilde
 | `.xervo_runtime(runtime)` | Reuse an existing `ModelRuntime` instead of building one ([sharing models](#sharing-models-across-databases)) |
 | `.cloud_config(config_dict)` | Cloud storage credentials (`s3`, `gcs`, `azure`) |
 | `.config(config_dict)` | Database options (`query_timeout`, `max_query_memory`, etc.) |
-| `.batch_size(n)` | I/O batch size (default 1024) |
+| `.batch_size(n)` | Rows per page a query cursor hands back (default 1024) |
 | `.wal_enabled(bool)` | Enable/disable write-ahead log (default `True`) |
 | `.strict_schema(bool)` | Reject writes with undeclared labels/edge types (default `False`) |
 | `.read_only()` | Open in read-only mode |

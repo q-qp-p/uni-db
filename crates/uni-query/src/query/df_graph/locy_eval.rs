@@ -38,6 +38,28 @@ pub fn eval_locy_expr(
     }
 }
 
+/// Evaluates a Locy filter condition (`WHERE` of `QUERY`, `DERIVE`, `ABDUCE`,
+/// `EXPLAIN RULE`, or a rule body's target-dependent condition).
+///
+/// True keeps the row; false and NULL ("unknown") drop it, as in Cypher. An
+/// evaluation error, or a value that is not a boolean, is an error. Every
+/// caller used to map both to "drop the row", so a malformed or unsupported
+/// condition silently returned fewer rows — for `DERIVE`, wrote fewer facts,
+/// and for `ABDUCE`, reported a conclusion as no longer holding.
+///
+/// # Errors
+///
+/// [`LocyError`] when the condition fails to evaluate or is not boolean.
+pub fn eval_condition(expr: &Expr, bindings: &FactRow, context: &str) -> Result<bool, LocyError> {
+    match eval_expr(expr, bindings)? {
+        Value::Bool(b) => Ok(b),
+        Value::Null => Ok(false),
+        other => Err(LocyError::TypeError {
+            message: format!("{context} must be a boolean, got {other:?}"),
+        }),
+    }
+}
+
 /// Evaluate a Cypher expression given variable bindings.
 pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
     match expr {
@@ -330,7 +352,42 @@ fn eval_unary_op(op: &UnaryOp, v: &Value) -> Result<Value, LocyError> {
     }
 }
 
+/// Cypher's three-valued `AND` / `OR` / `XOR`: NULL is "unknown", so
+/// `false AND NULL` is false and `true OR NULL` is true — not NULL.
+fn kleene(left: &Value, right: &Value, op: KleeneOp) -> Value {
+    let (l, r) = (left.as_bool(), right.as_bool());
+    match op {
+        KleeneOp::And => match (l, r) {
+            (Some(false), _) | (_, Some(false)) => Value::Bool(false),
+            (Some(true), Some(true)) => Value::Bool(true),
+            _ => Value::Null,
+        },
+        KleeneOp::Or => match (l, r) {
+            (Some(true), _) | (_, Some(true)) => Value::Bool(true),
+            (Some(false), Some(false)) => Value::Bool(false),
+            _ => Value::Null,
+        },
+        KleeneOp::Xor => match (l, r) {
+            (Some(a), Some(b)) => Value::Bool(a ^ b),
+            _ => Value::Null,
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KleeneOp {
+    And,
+    Or,
+    Xor,
+}
+
 fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result<Value, LocyError> {
+    match op {
+        LocyBinaryOp::And => return Ok(kleene(left, right, KleeneOp::And)),
+        LocyBinaryOp::Or => return Ok(kleene(left, right, KleeneOp::Or)),
+        LocyBinaryOp::Xor => return Ok(kleene(left, right, KleeneOp::Xor)),
+        _ => {}
+    }
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
@@ -338,25 +395,8 @@ fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result
         LocyBinaryOp::Add => numeric_op(left, right, |a, b| a + b, |a, b| a + b),
         LocyBinaryOp::Sub => numeric_op(left, right, |a, b| a - b, |a, b| a - b),
         LocyBinaryOp::Mul => numeric_op(left, right, |a, b| a * b, |a, b| a * b),
-        LocyBinaryOp::Div => {
-            let r = right.as_f64().unwrap_or(0.0);
-            if r == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "division by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a / b, |a, b| a / b)
-        }
-        LocyBinaryOp::Mod => {
-            // Guard against modulo by zero: an integer `a % 0` panics in Rust,
-            // so return a clean evaluation error instead of aborting the query.
-            if right.as_f64().unwrap_or(0.0) == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "modulo by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
-        }
+        LocyBinaryOp::Div => divide(left, right),
+        LocyBinaryOp::Mod => modulo(left, right),
         LocyBinaryOp::Pow => {
             let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
                 message: format!("pow requires numeric, got {left:?}"),
@@ -366,78 +406,47 @@ fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result
             })?;
             Ok(Value::Float(l.powf(r)))
         }
-        LocyBinaryOp::And => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a && b)),
-            _ => Ok(Value::Null),
-        },
-        LocyBinaryOp::Or => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a || b)),
-            _ => Ok(Value::Null),
-        },
-        LocyBinaryOp::Xor => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a ^ b)),
-            _ => Ok(Value::Null),
-        },
+        LocyBinaryOp::And | LocyBinaryOp::Or | LocyBinaryOp::Xor => {
+            unreachable!("handled above")
+        }
     }
 }
 
 fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, LocyError> {
+    match op {
+        BinaryOp::And => return Ok(kleene(left, right, KleeneOp::And)),
+        BinaryOp::Or => return Ok(kleene(left, right, KleeneOp::Or)),
+        BinaryOp::Xor => return Ok(kleene(left, right, KleeneOp::Xor)),
+        _ => {}
+    }
+    // Any comparison with NULL is NULL ("unknown"), as in Cypher and in a
+    // rule body's WHERE. `NULL = x` used to be false and `NULL <> x` true, so a
+    // `QUERY ... WHERE a.age <> 0` or `NOT (a.age = 30)` kept every row whose
+    // `age` is NULL.
     if left.is_null() || right.is_null() {
-        return match op {
-            BinaryOp::Eq => Ok(Value::Bool(left.is_null() && right.is_null())),
-            BinaryOp::NotEq => Ok(Value::Bool(!(left.is_null() && right.is_null()))),
-            _ => Ok(Value::Null),
-        };
+        return Ok(Value::Null);
     }
     match op {
         BinaryOp::Add => numeric_op(left, right, |a, b| a + b, |a, b| a + b),
         BinaryOp::Sub => numeric_op(left, right, |a, b| a - b, |a, b| a - b),
         BinaryOp::Mul => numeric_op(left, right, |a, b| a * b, |a, b| a * b),
-        BinaryOp::Div => {
-            // Guard against integer division by zero, which panics in Rust.
-            if right.as_f64().unwrap_or(0.0) == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "division by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a / b, |a, b| a / b)
-        }
-        BinaryOp::Mod => {
-            // Guard against integer modulo by zero, which panics in Rust.
-            if right.as_f64().unwrap_or(0.0) == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "modulo by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
-        }
+        BinaryOp::Div => divide(left, right),
+        BinaryOp::Mod => modulo(left, right),
         BinaryOp::Pow => {
-            let l = left.as_f64().unwrap_or(0.0);
-            let r = right.as_f64().unwrap_or(0.0);
+            let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
+                message: format!("pow requires numeric, got {left:?}"),
+            })?;
+            let r = right.as_f64().ok_or_else(|| LocyError::TypeError {
+                message: format!("pow requires numeric, got {right:?}"),
+            })?;
             Ok(Value::Float(l.powf(r)))
         }
         BinaryOp::Eq => Ok(Value::Bool(values_equal(left, right))),
         BinaryOp::NotEq => Ok(Value::Bool(!values_equal(left, right))),
-        BinaryOp::Lt => Ok(Value::Bool(value_less_than(left, right))),
-        BinaryOp::LtEq => Ok(Value::Bool(
-            value_less_than(left, right) || values_equal(left, right),
-        )),
-        BinaryOp::Gt => Ok(Value::Bool(value_less_than(right, left))),
-        BinaryOp::GtEq => Ok(Value::Bool(
-            value_less_than(right, left) || values_equal(left, right),
-        )),
-        BinaryOp::And => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a && b)),
-            _ => Ok(Value::Null),
-        },
-        BinaryOp::Or => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a || b)),
-            _ => Ok(Value::Null),
-        },
-        BinaryOp::Xor => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a ^ b)),
-            _ => Ok(Value::Null),
-        },
+        BinaryOp::Lt => Ok(compare(left, right, std::cmp::Ordering::is_lt)),
+        BinaryOp::LtEq => Ok(compare(left, right, std::cmp::Ordering::is_le)),
+        BinaryOp::Gt => Ok(compare(left, right, std::cmp::Ordering::is_gt)),
+        BinaryOp::GtEq => Ok(compare(left, right, std::cmp::Ordering::is_ge)),
         BinaryOp::Contains => match (left.as_str(), right.as_str()) {
             (Some(l), Some(r)) => Ok(Value::Bool(l.contains(r))),
             _ => Ok(Value::Null),
@@ -454,6 +463,28 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
             message: format!("unsupported binary op in in-memory evaluation: {op:?}"),
         }),
     }
+}
+
+/// `/`, as in Cypher: an integer divided by integer zero is an error (it
+/// panics in Rust); a float division follows IEEE 754, so `1 / 0.0` is
+/// Infinity and `0 / 0.0` NaN. Every zero divisor used to be an error.
+fn divide(left: &Value, right: &Value) -> Result<Value, LocyError> {
+    if let (Value::Int(_), Value::Int(0)) = (left, right) {
+        return Err(LocyError::EvaluationError {
+            message: "division by zero".to_string(),
+        });
+    }
+    numeric_op(left, right, i64::wrapping_div, |a, b| a / b)
+}
+
+/// `%`, as in Cypher: integer modulo zero is an error; a float one is NaN.
+fn modulo(left: &Value, right: &Value) -> Result<Value, LocyError> {
+    if let (Value::Int(_), Value::Int(0)) = (left, right) {
+        return Err(LocyError::EvaluationError {
+            message: "modulo by zero".to_string(),
+        });
+    }
+    numeric_op(left, right, i64::wrapping_rem, |a, b| a % b)
 }
 
 fn numeric_op(
@@ -484,13 +515,14 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
             match v {
                 Value::Int(i) => Ok(Value::Int(*i)),
                 Value::Float(f) => Ok(Value::Int(*f as i64)),
-                Value::String(s) => {
-                    s.parse::<i64>()
-                        .map(Value::Int)
-                        .map_err(|_| LocyError::TypeError {
-                            message: format!("cannot convert '{s}' to integer"),
-                        })
-                }
+                // A string that is not a number converts to NULL, as in
+                // Cypher; it used to be an error.
+                Value::String(s) => Ok(s
+                    .trim()
+                    .parse::<i64>()
+                    .map(Value::Int)
+                    .or_else(|_| s.trim().parse::<f64>().map(|f| Value::Int(f as i64)))
+                    .unwrap_or(Value::Null)),
                 _ => Ok(Value::Null),
             }
         }
@@ -499,13 +531,11 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
             match v {
                 Value::Float(f) => Ok(Value::Float(*f)),
                 Value::Int(i) => Ok(Value::Float(*i as f64)),
-                Value::String(s) => {
-                    s.parse::<f64>()
-                        .map(Value::Float)
-                        .map_err(|_| LocyError::TypeError {
-                            message: format!("cannot convert '{s}' to float"),
-                        })
-                }
+                Value::String(s) => Ok(s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::Float)
+                    .unwrap_or(Value::Null)),
                 _ => Ok(Value::Null),
             }
         }
@@ -745,6 +775,58 @@ pub fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         std::cmp::Ordering::Greater
     } else {
         std::cmp::Ordering::Equal
+    }
+}
+
+/// A three-valued ordering comparison (`<`, `<=`, `>`, `>=`), as in Cypher.
+///
+/// Values of types that have no order between them (`1 < 'a'`, a date and a
+/// datetime, two maps) compare as NULL. They used to compare as false, so
+/// `NOT (x < y)` kept every incomparable row. NaN is ordered against nothing
+/// and compares as false, as in Cypher.
+fn compare(left: &Value, right: &Value, holds: fn(std::cmp::Ordering) -> bool) -> Value {
+    match ordering(left, right) {
+        Comparable::Ordered(o) => Value::Bool(holds(o)),
+        Comparable::Unordered => Value::Bool(false),
+        Comparable::Incomparable => Value::Null,
+    }
+}
+
+enum Comparable {
+    Ordered(std::cmp::Ordering),
+    /// Same type, but no order (NaN).
+    Unordered,
+    /// No order between the types, or a NULL inside a list.
+    Incomparable,
+}
+
+fn ordering(a: &Value, b: &Value) -> Comparable {
+    use Comparable::*;
+    let float = |o: Option<std::cmp::Ordering>| o.map_or(Unordered, Ordered);
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => Incomparable,
+        (Value::Int(x), Value::Int(y)) => Ordered(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => float(x.partial_cmp(y)),
+        (Value::Int(x), Value::Float(y)) => float((*x as f64).partial_cmp(y)),
+        (Value::Float(x), Value::Int(y)) => float(x.partial_cmp(&(*y as f64))),
+        (Value::String(x), Value::String(y)) => Ordered(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Ordered(x.cmp(y)),
+        (Value::Temporal(x), Value::Temporal(y))
+            if std::mem::discriminant(x) == std::mem::discriminant(y) =>
+        {
+            Ordered(temporal_less_than(x, y))
+        }
+        // Lexicographic; a shorter prefix sorts first.
+        (Value::List(x), Value::List(y)) => {
+            for (l, r) in x.iter().zip(y) {
+                match ordering(l, r) {
+                    Ordered(std::cmp::Ordering::Equal) => {}
+                    other => return other,
+                }
+            }
+            Ordered(x.len().cmp(&y.len()))
+        }
+        _ => Incomparable,
     }
 }
 

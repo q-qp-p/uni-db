@@ -614,13 +614,13 @@ These aggregates are **not monotonic** and cannot be used in recursive strata. T
 
 | Aggregate | Description | Output Type |
 |-----------|-------------|-------------|
-| `SUM(expr)` | Sum of values | Float64 |
+| `SUM(expr)` | Sum of values; 0.0 when there are none, as in Cypher | Float64 |
 | `COUNT(expr)` | Count of non-null values | Int64 |
 | `COUNT(*)` | Count of all rows | Int64 |
 | `AVG(expr)` | Arithmetic mean | Float64 |
-| `MIN(expr)` | Minimum value | Same as input |
+| `MIN(expr)` | Minimum value | Same as input (an integer stays an integer) |
 | `MAX(expr)` | Maximum value | Same as input |
-| `COLLECT(expr)` | Collect into a list | List |
+| `COLLECT(expr)` | Collect into a list | List of the input's type |
 
 ```
 CREATE RULE spending AS

@@ -77,7 +77,7 @@ use datafusion::prelude::SessionContext;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use uni_algo::algo::AlgorithmRegistry;
 use uni_common::core::schema::{PropertyMeta, Schema as UniSchema};
 use uni_cypher::ast::{
@@ -152,6 +152,131 @@ pub struct HybridPhysicalPlanner {
     /// with the built-ins from `uni-plugin-builtin`; replace with
     /// [`Self::with_plugin_registry`] to use a host-supplied registry.
     plugin_registry: Arc<uni_plugin::PluginRegistry>,
+
+    /// Whether the node being planned may ignore row multiplicity.
+    ///
+    /// Set at the root by [`LogicalPlan::MultiplicityInsensitive`], and below
+    /// `Distinct` and multiplicity-insensitive aggregates; passed through only
+    /// by operators that preserve the set of distinct rows (see
+    /// [`Self::plan_internal`]). A variable-length traversal with no bound
+    /// variable reads it to choose reachability over per-path enumeration.
+    multiplicity_insensitive: AtomicBool,
+}
+
+/// The string `variable.ext_id` is required to equal, if some conjunct of
+/// `filter` pins it to a literal or a string parameter.
+fn ext_id_equality(
+    filter: Option<&Expr>,
+    variable: &str,
+    params: &HashMap<String, uni_common::Value>,
+) -> Option<String> {
+    let filter = filter?;
+    if let Expr::BinaryOp { left, op, right } = filter {
+        match op {
+            uni_cypher::ast::BinaryOp::And => {
+                return ext_id_equality(Some(left), variable, params)
+                    .or_else(|| ext_id_equality(Some(right), variable, params));
+            }
+            uni_cypher::ast::BinaryOp::Eq => {
+                let is_ext_id = |e: &Expr| {
+                    matches!(e, Expr::Property(base, key)
+                        if key == "ext_id" && matches!(base.as_ref(), Expr::Variable(v) if v == variable))
+                };
+                let string_of = |e: &Expr| match e {
+                    Expr::Literal(CypherLiteral::String(s)) => Some(s.clone()),
+                    Expr::Parameter(name) => match params.get(name) {
+                        Some(uni_common::Value::String(s)) => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if is_ext_id(left) {
+                    return string_of(right);
+                }
+                if is_ext_id(right) {
+                    return string_of(left);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `expr` is a `sum(...)` aggregate.
+fn is_sum_aggregate(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, window_spec: None, .. } if name.eq_ignore_ascii_case("sum"))
+}
+
+/// `sum_column`, with NULL replaced by a zero of its type.
+///
+/// Cypher's `sum` over no non-null value is 0 (Neo4j), like `count`;
+/// DataFusion's, following SQL, is NULL. A NULL there also spread: `sum(x) +
+/// 1` was NULL and `WHERE sum(x) < 10` dropped the group. The Cypher-value sum
+/// (`CypherSumUdaf`) and the row executor's accumulator already return 0.
+fn sum_of_nothing_is_zero(
+    sum_column: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    data_type: &DataType,
+) -> Result<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::common::ScalarValue;
+    let zero = match data_type {
+        DataType::Int64 => ScalarValue::Int64(Some(0)),
+        DataType::Float64 => ScalarValue::Float64(Some(0.0)),
+        DataType::LargeBinary => ScalarValue::LargeBinary(Some(
+            uni_common::cypher_value_codec::encode(&uni_common::Value::Int(0)),
+        )),
+        // Decimal or another type `sum` was not expected to produce: left as is.
+        _ => return Ok(sum_column),
+    };
+    Ok(Arc::new(
+        datafusion::physical_expr::expressions::CaseExpr::try_new(
+            None,
+            vec![(
+                datafusion::physical_expr::expressions::is_null(Arc::clone(&sum_column))?,
+                datafusion::physical_expr::expressions::lit(zero),
+            )],
+            Some(sum_column),
+        )?,
+    ))
+}
+
+/// Tags each row entering an `OPTIONAL MATCH` with a unique id, when this
+/// traversal is the clause's first hop.
+///
+/// The first hop is the one whose input binds none of the clause's own
+/// variables; later hops see rows the clause has already fanned out, which must
+/// keep the id assigned at entry. See `df_graph::optional_source`.
+fn tag_optional_source(
+    input: Arc<dyn ExecutionPlan>,
+    optional: bool,
+    optional_pattern_vars: &HashSet<String>,
+) -> Arc<dyn ExecutionPlan> {
+    let enters_clause = optional
+        && !input.schema().fields().iter().any(|f| {
+            crate::query::df_graph::traverse::is_optional_column_for_vars(
+                f.name(),
+                optional_pattern_vars,
+            )
+        });
+    if enters_clause {
+        Arc::new(crate::query::df_graph::optional_source::OptionalSourceRowIdExec::new(input))
+    } else {
+        input
+    }
+}
+
+/// Whether an aggregate's result is unchanged by duplicate input rows.
+///
+/// True for any `DISTINCT` aggregate and for `min` / `max`; an aggregate with
+/// no function (a bare grouping) is trivially insensitive. `count(*)`, `sum`,
+/// `avg` and a non-DISTINCT `collect` all see every duplicate.
+fn aggregate_ignores_multiplicity(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, distinct, .. } => {
+            *distinct || name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")
+        }
+        _ => false,
+    }
 }
 
 /// Whether a traversal must publish [`COL_FWD`] so the edge struct can carry
@@ -229,6 +354,7 @@ impl HybridPhysicalPlanner {
             mutation_ctx: None,
             outer_entity_vars: HashSet::new(),
             plugin_registry: super::df_graph::locy_fold::default_locy_plugin_registry(),
+            multiplicity_insensitive: AtomicBool::new(false),
         }
     }
 
@@ -386,6 +512,7 @@ impl HybridPhysicalPlanner {
             mutation_ctx: None,
             outer_entity_vars: HashSet::new(),
             plugin_registry: super::df_graph::locy_fold::default_locy_plugin_registry(),
+            multiplicity_insensitive: AtomicBool::new(false),
         }
     }
 
@@ -606,15 +733,45 @@ impl HybridPhysicalPlanner {
                     labels.insert(sv.clone(), type_names[0].clone());
                 }
             }
+            // A projection or UNWIND rebinds names, exactly as in
+            // `collect_variable_kinds`: after `WITH r AS a`, `a`'s label is
+            // `r`'s, not that of the node a scan bound to `a` below. Left in
+            // place, `type(a)` resolved to the old node's label and compared
+            // false for every row.
+            LogicalPlan::Project { input, projections } => {
+                self.collect_variable_labels(input, labels);
+                let below = labels.clone();
+                for (expr, alias) in projections {
+                    let Some(alias) = alias else { continue };
+                    match expr {
+                        Expr::Variable(src) if src == alias => {}
+                        Expr::Variable(src) => match below.get(src) {
+                            Some(label) => {
+                                labels.insert(alias.clone(), label.clone());
+                            }
+                            None => {
+                                labels.remove(alias);
+                            }
+                        },
+                        _ => {
+                            labels.remove(alias);
+                        }
+                    }
+                }
+            }
+            LogicalPlan::Unwind {
+                input, variable, ..
+            } => {
+                self.collect_variable_labels(input, labels);
+                labels.remove(variable);
+            }
             // Wrapper nodes: recurse into input(s)
             LogicalPlan::Filter { input, .. }
-            | LogicalPlan::Project { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Window { input, .. }
-            | LogicalPlan::Unwind { input, .. }
             | LogicalPlan::Create { input, .. }
             | LogicalPlan::CreateBatch { input, .. }
             | LogicalPlan::Merge { input, .. }
@@ -642,7 +799,8 @@ impl HybridPhysicalPlanner {
             // scans may bind labeled variables — recurse so those labels are
             // not lost (exhaustive; no `_ => {}` so a new variant must be
             // classified here — the #131 bug class).
-            LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            LogicalPlan::FusedIndexScanWrapped { inner, .. }
+            | LogicalPlan::MultiplicityInsensitive { input: inner } => {
                 self.collect_variable_labels(inner, labels);
             }
             LogicalPlan::ShortestPath { input, .. }
@@ -727,6 +885,15 @@ impl HybridPhysicalPlanner {
     ///
     /// Returns an error if planning fails (unsupported operation, schema mismatch, etc.)
     pub fn plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
+        // A root `MultiplicityInsensitive` marker becomes the planner flag and
+        // is stripped before the logical pre-passes below, which would
+        // otherwise stop at a node they do not recognise.
+        let (logical, insensitive) = match logical {
+            LogicalPlan::MultiplicityInsensitive { input } => (input.as_ref(), true),
+            other => (other, false),
+        };
+        self.multiplicity_insensitive
+            .store(insensitive, Ordering::Relaxed);
         // Pre-pass: lift UNWIND-correlated IN-list filters into the scan
         // subtrees of any Filter(CrossJoin(L, R)) shapes. Runs as a pure
         // logical-plan rewrite *before* any physical-plan optimization
@@ -821,12 +988,50 @@ impl HybridPhysicalPlanner {
         )?))
     }
 
+    /// Plan one node, first deciding whether its subtree may ignore row
+    /// multiplicity (see [`Self::multiplicity_insensitive`]).
+    ///
+    /// `Distinct`, and an aggregate whose every aggregate ignores duplicates,
+    /// make their input insensitive. `Project`, `Filter`, `Sort` and
+    /// traversals preserve the set of distinct rows, so they pass the inherited
+    /// value through. Every other operator — `Limit`, a counting aggregate, a
+    /// join, a mutation — may observe a duplicate, so its subtree is planned
+    /// as sensitive. Unknown operators default to sensitive, which is always
+    /// correct and at worst slower.
     fn plan_internal(
         &self,
         logical: &LogicalPlan,
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let inherited = self.multiplicity_insensitive.load(Ordering::Relaxed);
+        let here = match logical {
+            LogicalPlan::MultiplicityInsensitive { .. } | LogicalPlan::Distinct { .. } => true,
+            LogicalPlan::Aggregate { aggregates, .. } => {
+                aggregates.iter().all(aggregate_ignores_multiplicity)
+            }
+            LogicalPlan::Project { .. }
+            | LogicalPlan::Filter { .. }
+            | LogicalPlan::Sort { .. }
+            | LogicalPlan::Traverse { .. }
+            | LogicalPlan::TraverseMainByType { .. } => inherited,
+            _ => false,
+        };
+        self.multiplicity_insensitive.store(here, Ordering::Relaxed);
+        let planned = self.plan_node(logical, all_properties);
+        self.multiplicity_insensitive
+            .store(inherited, Ordering::Relaxed);
+        planned
+    }
+
+    fn plan_node(
+        &self,
+        logical: &LogicalPlan,
+        all_properties: &HashMap<String, HashSet<String>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         match logical {
+            LogicalPlan::MultiplicityInsensitive { input } => {
+                self.plan_internal(input, all_properties)
+            }
             // === Graph Operations ===
             // Phase 5b followup: `FusedIndexScanWrapped` is a
             // planner-side observability wrapper around lossy
@@ -2584,8 +2789,12 @@ impl HybridPhysicalPlanner {
         (properties, need_full)
     }
 
-    /// Collect edge columns (`._eid` and `__eid_to_*`) from a schema, filtered to the
-    /// current MATCH scope. Optionally excludes a specific column (for rebound edge patterns).
+    /// Collect edge columns (`._eid`, `__eid_to_*`, and a variable-length step
+    /// variable's `List<Edge>`) from a schema, filtered to the current MATCH
+    /// scope. Optionally excludes a specific column (for rebound edge patterns).
+    ///
+    /// The list column is how a relationship after a variable-length one learns
+    /// which edges that one walked; without it the later hop could reuse them.
     fn collect_used_edge_columns(
         schema: &SchemaRef,
         scope_match_variables: &HashSet<String>,
@@ -2608,11 +2817,27 @@ impl HybridPhysicalPlanner {
                     scope_match_variables
                         .contains(var_name)
                         .then(|| name.clone())
+                } else if scope_match_variables.contains(name.as_str())
+                    && Self::is_edge_list(f.data_type())
+                {
+                    Some(name.clone())
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    /// Whether `data_type` is a list of edge structs, the shape of a
+    /// variable-length step variable.
+    fn is_edge_list(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::List(item) => matches!(
+                item.data_type(),
+                DataType::Struct(fields) if fields.iter().any(|f| f.name() == "_eid")
+            ),
+            _ => false,
+        }
     }
 
     /// Conditionally add edge structural projection when the edge variable has wildcard access.
@@ -3277,6 +3502,19 @@ impl HybridPhysicalPlanner {
         {
             scan_exec = scan_exec.with_vid_list_filter(vids);
         }
+        // `(n {ext_id: 'x'})`: push the equality down so the main table's
+        // `ext_id` index answers it. Flushed rows only — the Cypher filter the
+        // scan is finalized with still applies to every row, unflushed ones
+        // included, and remains the authoritative check.
+        if let Some(ext_id) = ext_id_equality(filter, variable, &self.params) {
+            let lance = uni_store::backend::types::FilterExpr::equals(
+                "ext_id",
+                uni_store::backend::types::Scalar::Str(ext_id),
+            )
+            .to_sql()
+            .map_err(|e| anyhow!("ext_id pushdown: {e}"))?;
+            scan_exec = scan_exec.with_extra_lance_filter(lance);
+        }
         let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
         self.finalize_schemaless_scan(
             scan_plan,
@@ -3317,6 +3555,7 @@ impl HybridPhysicalPlanner {
         qpp_inner_source: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input_plan = self.plan_internal(input, all_properties)?;
+        let input_plan = tag_optional_source(input_plan, optional, optional_pattern_vars);
 
         let adj_direction = convert_direction(direction.clone());
         let (input_plan, source_col) = Self::resolve_source_vid_col(input_plan, source_variable)?;
@@ -3744,8 +3983,10 @@ impl HybridPhysicalPlanner {
                     crate::query::df_graph::nfa::VlpOutputMode::StepVariable
                 } else if path_variable.is_some() {
                     crate::query::df_graph::nfa::VlpOutputMode::FullPath
+                } else if self.multiplicity_insensitive.load(Ordering::Relaxed) {
+                    crate::query::df_graph::nfa::VlpOutputMode::Reachability
                 } else {
-                    crate::query::df_graph::nfa::VlpOutputMode::EndpointsOnly
+                    crate::query::df_graph::nfa::VlpOutputMode::EndpointsPerPath
                 };
 
                 // Compile QPP NFA if multi-step pattern, otherwise let exec compile VLP NFA
@@ -3938,6 +4179,7 @@ impl HybridPhysicalPlanner {
         scope_match_variables: &HashSet<String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input_plan = self.plan_internal(input, all_properties)?;
+        let input_plan = tag_optional_source(input_plan, optional, optional_pattern_vars);
 
         let adj_direction = convert_direction(direction.clone());
         let (input_plan, source_col) = Self::resolve_source_vid_col(input_plan, source_variable)?;
@@ -4146,8 +4388,10 @@ impl HybridPhysicalPlanner {
             crate::query::df_graph::nfa::VlpOutputMode::StepVariable
         } else if path_variable.is_some() {
             crate::query::df_graph::nfa::VlpOutputMode::FullPath
+        } else if self.multiplicity_insensitive.load(Ordering::Relaxed) {
+            crate::query::df_graph::nfa::VlpOutputMode::Reachability
         } else {
-            crate::query::df_graph::nfa::VlpOutputMode::EndpointsOnly
+            crate::query::df_graph::nfa::VlpOutputMode::EndpointsPerPath
         };
 
         let traverse_plan = Arc::new(GraphVariableLengthTraverseMainExec::new(
@@ -4260,7 +4504,7 @@ impl HybridPhysicalPlanner {
         let session = self.session_ctx.read();
         let state = session.state();
         let compiler = self.expr_compiler(&state, Some(&ctx));
-        let physical_predicate = compiler.compile(predicate, &schema)?;
+        let physical_predicate = compiler.compile_predicate(predicate, &schema)?;
 
         // For OPTIONAL MATCH: use OptionalFilterExec for proper NULL row preservation.
         if !optional_variables.is_empty() {
@@ -4487,7 +4731,7 @@ impl HybridPhysicalPlanner {
             let session = self.session_ctx.read();
             let state = session.state();
             let compiler = self.expr_compiler(&state, Some(&merged_ctx));
-            let physical_residual = compiler.compile(&residual, &join_schema)?;
+            let physical_residual = compiler.compile_predicate(&residual, &join_schema)?;
             return Ok(Some(Arc::new(FilterExec::try_new(
                 physical_residual,
                 join,
@@ -4779,6 +5023,39 @@ impl HybridPhysicalPlanner {
     }
 
     /// Build projection expressions from an already-planned input.
+    /// Carries `var`'s flattened columns (`{var}._vid`, `{var}._labels`,
+    /// `{var}.{prop}`) through a projection, named for the binding they now
+    /// belong to: `{name}.*`.
+    ///
+    /// They used to keep the source's name, so after `WITH b AS a` there was no
+    /// `a.id` (a filter on it failed to plan) and, in a swap `WITH b AS a, a AS
+    /// b`, the `a.*` columns still held the old `a`'s values — a filter on
+    /// `a.id` read the wrong node and returned wrong rows.
+    fn carry_entity_columns(
+        schema: &SchemaRef,
+        var: &str,
+        name: &str,
+        exprs: &mut Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)>,
+    ) {
+        let prefix = format!("{var}.");
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let Some(suffix) = field.name().strip_prefix(&prefix) else {
+                continue;
+            };
+            let out = format!("{name}.{suffix}");
+            if exprs.iter().any(|(_, n)| *n == out) {
+                continue;
+            }
+            exprs.push((
+                Arc::new(datafusion::physical_expr::expressions::Column::new(
+                    field.name(),
+                    idx,
+                )),
+                out,
+            ));
+        }
+    }
+
     fn plan_project_from_input(
         &self,
         input_plan: Arc<dyn ExecutionPlan>,
@@ -4824,41 +5101,8 @@ impl HybridPhysicalPlanner {
                         datafusion::physical_expr::expressions::Column::new(var_name, col_idx),
                     );
                     let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-
-                    // Include _vid and _labels as helper columns for post-processing
-                    let vid_col = format!("{}._vid", var_name);
-                    let labels_col = format!("{}._labels", var_name);
-                    if let Some((vi, _)) = schema.column_with_name(&vid_col) {
-                        let ve: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&vid_col, vi),
-                        );
-                        exprs.push((ve, vid_col.clone()));
-                    }
-                    if let Some((li, _)) = schema.column_with_name(&labels_col) {
-                        let le: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&labels_col, li),
-                        );
-                        exprs.push((le, labels_col.clone()));
-                    }
-
-                    // Carry through all {var}.{prop} columns so downstream
-                    // operators (e.g. RETURN n.name after WITH n) can find them.
-                    let prefix = format!("{}.", var_name);
-                    for (idx, field) in schema.fields().iter().enumerate() {
-                        let fname = field.name();
-                        if fname.starts_with(&prefix)
-                            && fname != &vid_col
-                            && fname != &labels_col
-                            && !exprs.iter().any(|(_, n)| n == fname)
-                        {
-                            let prop_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                                Arc::new(datafusion::physical_expr::expressions::Column::new(
-                                    fname, idx,
-                                ));
-                            exprs.push((prop_expr, fname.clone()));
-                        }
-                    }
+                    exprs.push((col_expr, name.clone()));
+                    Self::carry_entity_columns(&schema, var_name, &name, &mut exprs);
                     continue;
                 }
 
@@ -4888,7 +5132,17 @@ impl HybridPhysicalPlanner {
                         )));
                     }
 
-                    let struct_expr = named_struct(struct_args);
+                    let struct_expr = match ["_vid", "_eid"].iter().find(|id| {
+                        expanded_fields
+                            .iter()
+                            .any(|(_, f)| f.strip_prefix(prefix.as_str()) == Some(**id))
+                    }) {
+                        Some(id) => Self::absent_entity_is_null(
+                            named_struct(struct_args),
+                            &format!("{prefix}{id}"),
+                        ),
+                        None => named_struct(struct_args),
+                    };
                     let df_schema =
                         datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
                     let session = self.session_ctx.read();
@@ -4905,40 +5159,8 @@ impl HybridPhysicalPlanner {
                     )?;
 
                     let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((physical_struct_expr, name));
-
-                    // Also include _vid and _labels helpers
-                    let vid_col = format!("{}._vid", var_name);
-                    let labels_col = format!("{}._labels", var_name);
-                    if let Some((vi, _)) = schema.column_with_name(&vid_col) {
-                        let ve: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&vid_col, vi),
-                        );
-                        exprs.push((ve, vid_col.clone()));
-                    }
-                    if let Some((li, _)) = schema.column_with_name(&labels_col) {
-                        let le: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&labels_col, li),
-                        );
-                        exprs.push((le, labels_col.clone()));
-                    }
-
-                    // Carry through remaining {var}.{prop} columns not already
-                    // included by the struct projection above.
-                    for (idx, field) in schema.fields().iter().enumerate() {
-                        let fname = field.name();
-                        if fname.starts_with(&prefix)
-                            && fname != &vid_col
-                            && fname != &labels_col
-                            && !exprs.iter().any(|(_, n)| n == fname)
-                        {
-                            let prop_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                                Arc::new(datafusion::physical_expr::expressions::Column::new(
-                                    fname, idx,
-                                ));
-                            exprs.push((prop_expr, fname.clone()));
-                        }
-                    }
+                    exprs.push((physical_struct_expr, name.clone()));
+                    Self::carry_entity_columns(&schema, var_name, &name, &mut exprs);
                     continue;
                 }
                 // Fall through to normal expression compilation if no matching columns at all
@@ -5034,6 +5256,32 @@ impl HybridPhysicalPlanner {
                     continue;
                 }
                 // Fall through to generic expression compilation
+            }
+
+            // A recursive rule's referenced-fact discriminator (#159): a hash of
+            // the referenced row's columns, read by name from the derived scan.
+            if let Expr::FunctionCall { name, args, .. } = expr
+                && name == crate::query::df_graph::locy_row_hash::ROW_HASH_FN
+            {
+                let children = args
+                    .iter()
+                    .map(|arg| {
+                        let Expr::Variable(col) = arg else {
+                            return Err(anyhow!("{name} takes column names"));
+                        };
+                        let (idx, _) = schema
+                            .column_with_name(col)
+                            .ok_or_else(|| anyhow!("{name}: no column {col}"))?;
+                        Ok(Arc::new(Column::new(col, idx))
+                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let hash = crate::query::df_graph::locy_row_hash::RowHashExpr::new(children);
+                exprs.push((
+                    Arc::new(hash),
+                    alias.clone().unwrap_or_else(|| name.clone()),
+                ));
+                continue;
             }
 
             // Generic expression compilation (property access, literals, etc.)
@@ -5200,9 +5448,12 @@ impl HybridPhysicalPlanner {
             Vec::new();
 
         for (i, field) in agg_schema.fields().iter().enumerate() {
-            let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+            let mut col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
                 datafusion::physical_expr::expressions::Column::new(field.name(), i),
             );
+            if i >= num_group_by && is_sum_aggregate(&aggregates[i - num_group_by]) {
+                col_expr = sum_of_nothing_is_zero(col_expr, field.data_type())?;
+            }
             let name = if i >= num_group_by {
                 // Rename aggregate column to expected Cypher name
                 aggregate_column_name(&aggregates[i - num_group_by])
@@ -6195,6 +6446,8 @@ impl HybridPhysicalPlanner {
             std::sync::Arc<dyn datafusion::physical_expr::window::WindowExpr>,
             Vec<datafusion::physical_expr::PhysicalSortExpr>,
         )> = Vec::new();
+        // Output names of the `sum` windows, whose NULL becomes 0 below.
+        let mut sum_columns: HashSet<String> = HashSet::new();
 
         for expr in window_exprs {
             let Expr::FunctionCall {
@@ -6299,9 +6552,20 @@ impl HybridPhysicalPlanner {
                             let mut df_expr = cypher_expr_to_df(arg, tx_ctx.as_ref())?;
 
                             // Cast numeric types only for SUM/AVG aggregate functions:
-                            // SUM needs Int64 to avoid overflow, AVG needs Float64
+                            // SUM widens integers to Int64 and floats to Float64, as
+                            // the grouped `sum` does — casting every argument to
+                            // Int64 truncated each float before it was added
+                            // (`sum(0.5, 1.25) OVER ()` returned 1). AVG needs Float64.
                             if is_aggregate {
+                                let is_float = matches!(
+                                    df_expr.get_type(&df_schema),
+                                    Ok(datafusion::arrow::datatypes::DataType::Float32
+                                        | datafusion::arrow::datatypes::DataType::Float64)
+                                );
                                 let cast_type = match name_lower.as_str() {
+                                    "sum" if is_float => {
+                                        Some(datafusion::arrow::datatypes::DataType::Float64)
+                                    }
                                     "sum" => Some(datafusion::arrow::datatypes::DataType::Int64),
                                     "avg" => Some(datafusion::arrow::datatypes::DataType::Float64),
                                     _ => None,
@@ -6433,6 +6697,9 @@ impl HybridPhysicalPlanner {
                 }
             }
 
+            if name_lower == "sum" {
+                sum_columns.insert(window_expr.name().to_string());
+            }
             window_specs.push((window_expr, required_ordering));
         }
 
@@ -6459,7 +6726,24 @@ impl HybridPhysicalPlanner {
             )?);
         }
 
-        Ok(plan)
+        // A `sum` window over a frame with no non-null value is 0, as the grouped
+        // `sum` is (see `sum_of_nothing_is_zero`), not SQL's NULL.
+        if sum_columns.is_empty() {
+            return Ok(plan);
+        }
+        let schema = plan.schema();
+        let mut proj_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+            Vec::with_capacity(schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            let mut column: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+                datafusion::physical_expr::expressions::Column::new(field.name(), i),
+            );
+            if sum_columns.contains(field.name()) {
+                column = sum_of_nothing_is_zero(column, field.data_type())?;
+            }
+            proj_exprs.push((column, field.name().clone()));
+        }
+        Ok(Arc::new(ProjectionExec::try_new(proj_exprs, plan)?))
     }
 
     /// Plan an empty input that produces exactly one row.
@@ -6618,6 +6902,20 @@ impl HybridPhysicalPlanner {
 
     /// Add a structural projection on top of an execution plan to create a Struct column
     /// for a Node or Edge variable.
+    /// `entity` when `id_column` is non-null, and NULL otherwise.
+    ///
+    /// `named_struct` is never NULL, even when every field is: an entity an
+    /// OPTIONAL MATCH did not bind became a struct of NULLs, which `labels()`
+    /// rejected, `keys()` read as `[]` (or, for a relationship, as its
+    /// declared property names), and a list or map holding it collapsed to
+    /// NULL as a whole.
+    fn absent_entity_is_null(entity: DfExpr, id_column: &str) -> DfExpr {
+        let id = DfExpr::Column(datafusion::common::Column::from_name(id_column));
+        datafusion::logical_expr::when(id.is_not_null(), entity.clone())
+            .end()
+            .unwrap_or(entity)
+    }
+
     fn add_structural_projection(
         &self,
         input: Arc<dyn ExecutionPlan>,
@@ -6664,7 +6962,8 @@ impl HybridPhysicalPlanner {
         }
 
         // If no properties, still create an empty struct to represent the entity
-        let struct_expr = named_struct(struct_args);
+        let struct_expr =
+            Self::absent_entity_is_null(named_struct(struct_args), &format!("{}._vid", variable));
 
         let df_schema = datafusion::common::DFSchema::try_from(input_schema.as_ref().clone())?;
         let session = self.session_ctx.read();
@@ -6813,7 +7112,8 @@ impl HybridPhysicalPlanner {
             )));
         }
 
-        let struct_expr = named_struct(struct_args);
+        let struct_expr =
+            Self::absent_entity_is_null(named_struct(struct_args), &format!("{}._eid", variable));
 
         let df_schema = datafusion::common::DFSchema::try_from(input_schema.as_ref().clone())?;
         let session = self.session_ctx.read();
@@ -7440,7 +7740,8 @@ pub(crate) fn collect_variable_kinds(
     match plan {
         // Phase 5b followup: recurse into the wrapped node so the
         // wrapped operator's variable still gets collected.
-        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+        LogicalPlan::FusedIndexScanWrapped { inner, .. }
+        | LogicalPlan::MultiplicityInsensitive { input: inner } => {
             collect_variable_kinds(inner, kinds);
         }
         LogicalPlan::Scan { variable, .. }
@@ -7582,8 +7883,33 @@ pub(crate) fn collect_variable_kinds(
             kinds.insert(path_variable.clone(), VariableKind::Path);
         }
         // Wrapper nodes: recurse into input(s)
+        // A projection rebinds its aliases, as UNWIND does (below): after
+        // `WITH b AS a`, `a` is whatever `b` was, and after `WITH r.w AS a` it is
+        // a plain value — not the node a scan bound to `a` further down. Read
+        // from a snapshot, so a swap (`WITH b AS a, a AS b`) reads each source
+        // before either is overwritten.
+        LogicalPlan::Project { input, projections } => {
+            collect_variable_kinds(input, kinds);
+            let below = kinds.clone();
+            for (expr, alias) in projections {
+                let Some(alias) = alias else { continue };
+                match expr {
+                    Expr::Variable(src) if src == alias => {}
+                    Expr::Variable(src) => match below.get(src) {
+                        Some(kind) => {
+                            kinds.insert(alias.clone(), *kind);
+                        }
+                        None => {
+                            kinds.remove(alias);
+                        }
+                    },
+                    _ => {
+                        kinds.insert(alias.clone(), VariableKind::Opaque);
+                    }
+                }
+            }
+        }
         LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Aggregate { input, .. }
@@ -7715,6 +8041,7 @@ fn collect_mutation_node_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         // For all other nodes, recurse into inputs
         LogicalPlan::Traverse { input, .. }
         | LogicalPlan::TraverseMainByType { input, .. }
+        | LogicalPlan::MultiplicityInsensitive { input }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -7844,6 +8171,7 @@ fn collect_mutation_edge_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         // For all other nodes, recurse into inputs
         LogicalPlan::Traverse { input, .. }
         | LogicalPlan::TraverseMainByType { input, .. }
+        | LogicalPlan::MultiplicityInsensitive { input }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -8058,7 +8386,8 @@ fn insert_node_var(variable: &str, out: &mut HashSet<String>) {
 fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
     match plan {
         // Wrapped scan: recurse so the inner scan's variable is still collected.
-        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+        LogicalPlan::FusedIndexScanWrapped { inner, .. }
+        | LogicalPlan::MultiplicityInsensitive { input: inner } => {
             collect_plan_variables_into(inner, out);
         }
         // Leaf node scans — each binds one node variable (+ `_vid`).

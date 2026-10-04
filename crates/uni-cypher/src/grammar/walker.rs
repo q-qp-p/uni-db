@@ -788,6 +788,38 @@ fn accumulate_label(expr: Expr, label: String) -> Expr {
     }
 }
 
+/// A label predicate `n:A` (stacking onto a preceding `:B` as `n:B:A`), or a
+/// disjunction `n:A|B`, lowered to `n:A OR n:B`. A disjunction was a parse
+/// error in an expression, though a pattern accepted it. Mixing the two
+/// (`n:A:B|C`) is refused, as GQL refuses it.
+fn label_predicate(left: Expr, first: Pair<Rule>, rest: Pairs<Rule>) -> Result<Expr, ParseError> {
+    let mut labels = vec![normalize_identifier(first.as_str())];
+    labels.extend(
+        rest.filter(|p| p.as_rule() == Rule::identifier_or_keyword)
+            .map(|p| normalize_identifier(p.as_str())),
+    );
+    if labels.len() == 1 {
+        return Ok(accumulate_label(left, labels.remove(0)));
+    }
+    if matches!(left, Expr::LabelCheck { .. }) {
+        return Err(ParseError::new(
+            "InvalidLabelExpression: a label conjunction (`:A:B`) cannot be combined \
+             with a disjunction (`|`)"
+                .to_string(),
+        ));
+    }
+    let mut checks = labels.into_iter().map(|label| Expr::LabelCheck {
+        expr: Box::new(left.clone()),
+        labels: vec![label],
+    });
+    let first = checks.next().expect("two or more labels");
+    Ok(checks.fold(first, |acc, check| Expr::BinaryOp {
+        left: Box::new(acc),
+        op: BinaryOp::Or,
+        right: Box::new(check),
+    }))
+}
+
 fn apply_tail_to_expr(
     left: Expr,
     rule: Rule,
@@ -801,10 +833,8 @@ fn apply_tail_to_expr(
                 Rule::NULL => Ok(Expr::IsNull(Box::new(left))),
                 Rule::NOT => Ok(Expr::IsNotNull(Box::new(left))),
                 Rule::UNIQUE => Ok(Expr::IsUnique(Box::new(left))),
-                _ => {
-                    let label = tail_inner.next().unwrap().as_str().to_string();
-                    Ok(accumulate_label(left, label))
-                }
+                Rule::identifier_or_keyword => label_predicate(left, next, tail_inner),
+                other => unreachable!("Unexpected IS form: {other:?}"),
             }
         }
         Rule::IN => Ok(Expr::In {
@@ -848,10 +878,7 @@ fn apply_tail_to_expr(
                 end_prop,
             })
         }
-        Rule::identifier_or_keyword => Ok(accumulate_label(
-            left,
-            normalize_identifier(op_pair.as_str()),
-        )),
+        Rule::identifier_or_keyword => label_predicate(left, op_pair, tail_inner),
         _ => unreachable!("Unexpected non-chainable rule: {:?}", rule),
     }
 }

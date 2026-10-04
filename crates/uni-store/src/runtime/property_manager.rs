@@ -635,6 +635,7 @@ impl PropertyManager {
             columns.extend(valid_props.iter().map(|s| s.to_string()));
             // Add overflow_json to fetch non-schema properties
             columns.push("overflow_json".to_string());
+            retain_first_occurrences(&mut columns);
 
             use crate::backend::types::ScanRequest;
             let request = ScanRequest::all(&vtable_name)
@@ -977,6 +978,7 @@ impl PropertyManager {
             columns.extend(valid_props.iter().map(|s| s.to_string()));
             // Add overflow_json to fetch non-schema properties
             columns.push("overflow_json".to_string());
+            retain_first_occurrences(&mut columns);
 
             use crate::backend::types::ScanRequest;
             let request = ScanRequest::all(&dtable_name)
@@ -1462,6 +1464,7 @@ impl PropertyManager {
         ];
         columns.extend(prop_names.iter().cloned());
         columns.push("overflow_json".to_string());
+        retain_first_occurrences(&mut columns);
 
         // Build IN filter for all VIDs at once.
         let base_filter = FilterExpr::one_of(
@@ -2647,4 +2650,15 @@ impl PropertyManager {
         }
         Ok(())
     }
+}
+
+/// Drops repeated column names, keeping each first occurrence in place.
+///
+/// Callers pass the properties a query reads, and a predicate that names one
+/// twice (`b.id < 0 AND b.id = 0`) listed it twice. Lance rejects a
+/// projection with a duplicate column ("Duplicate column name: id"), so the
+/// query failed.
+fn retain_first_occurrences(columns: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    columns.retain(|c| seen.insert(c.clone()));
 }

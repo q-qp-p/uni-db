@@ -1342,7 +1342,7 @@ impl MutationEvents {
                 Some(p) if p.vertex_pre_existed(*vid) => (
                     TriggerEventMask::NODE_UPDATE,
                     p.vertex_old_bytes(*vid),
-                    p.vertex_properties(*vid).and_then(&filtered),
+                    p.vertex_properties(*vid).and_then(filtered),
                 ),
                 Some(_) => (TriggerEventMask::NODE_CREATE, None, None),
                 None => (TriggerEventMask::NODE_UPDATE, None, None),
@@ -1382,7 +1382,7 @@ impl MutationEvents {
             let old = probe.and_then(|p| p.vertex_old_bytes(*vid));
             let old_props_map = probe
                 .and_then(|p| p.vertex_properties(*vid))
-                .and_then(&filtered);
+                .and_then(filtered);
             match labels {
                 Some(ls) if !ls.is_empty() => {
                     for l in ls {
@@ -1441,12 +1441,12 @@ impl MutationEvents {
                 Some(p) if p.edge_pre_existed(*eid) => (
                     TriggerEventMask::EDGE_UPDATE,
                     p.edge_old_bytes(*eid),
-                    p.edge_properties(*eid).and_then(&filtered),
+                    p.edge_properties(*eid).and_then(filtered),
                 ),
                 Some(_) => (TriggerEventMask::EDGE_CREATE, None, None),
                 None => (TriggerEventMask::EDGE_UPDATE, None, None),
             };
-            let new_props_map = l0.edge_properties.get(eid).and_then(&filtered);
+            let new_props_map = l0.edge_properties.get(eid).and_then(filtered);
             rows.push(MutationRow {
                 event_kind: kind,
                 vid_or_eid: eid_to_i64(*eid),
@@ -1468,7 +1468,7 @@ impl MutationEvents {
             let old = probe.and_then(|p| p.edge_old_bytes(*eid));
             let old_props_map = probe
                 .and_then(|p| p.edge_properties(*eid))
-                .and_then(&filtered);
+                .and_then(filtered);
             rows.push(MutationRow {
                 event_kind: TriggerEventMask::EDGE_DELETE,
                 vid_or_eid: eid_to_i64(*eid),

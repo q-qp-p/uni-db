@@ -23,10 +23,12 @@ use proptest::prelude::*;
 use uni_common::{LocyIncompleteReason, Value};
 use uni_db::{Uni, UniError};
 
-use uni_locy_oracle::eval::{Relation, evaluate};
+use uni_locy_oracle::eval::{Relation, evaluate, evaluate_bags};
 use uni_locy_oracle::generator::{
     build_complement, build_layered_dag, build_union, expected_closure_size,
+    random_program_strategy,
 };
+use uni_locy_oracle::ir::PROB_SCALE;
 use uni_locy_oracle::ir::{Generated, Tuple};
 
 /// Recovers the seeded integer id from a `YIELD KEY` column value.
@@ -409,4 +411,156 @@ fn closure_is_set_soak() {
             Ok(())
         })
         .expect("soak: engine diverged from oracle");
+}
+
+// ── W5: random programs over a multigraph, FOLD included ─────────────────────
+
+/// A relation column value as the oracle's `i64`: a node by its `id`, an
+/// integer as is, and — only in a sum column (`s`), whose `SUM`/`MSUM` is a
+/// float by definition — an integral float. Anything else is reported, not
+/// coerced: an integer `MIN` that came back as `2.0` is the defect W4 found.
+fn column_to_i64(column: &str, value: &Value) -> Option<i64> {
+    match value {
+        Value::Node(_) | Value::Int(_) if column != PROB_COLUMN => Some(key_to_id(value)),
+        Value::Float(f) if column == "s" && f.fract() == 0.0 => Some(*f as i64),
+        // A probability, in the oracle's fixed-point units.
+        Value::Float(f) if column == PROB_COLUMN => Some((f * PROB_SCALE as f64).round() as i64),
+        _ => None,
+    }
+}
+
+/// The PROB column of every probabilistic relation the generator emits.
+const PROB_COLUMN: &str = "pb";
+
+/// Whether two sorted bags agree, a probability within two fixed-point units
+/// (floating-point evaluation order differs between the two sides).
+fn bags_agree(got: &[Tuple], want: &[Tuple], cols: &[String]) -> bool {
+    got.len() == want.len()
+        && got.iter().zip(want).all(|(g, w)| {
+            g.iter().zip(w).zip(cols).all(|((a, b), c)| {
+                if c == PROB_COLUMN {
+                    (a - b).abs() <= 2
+                } else {
+                    a == b
+                }
+            })
+        })
+}
+
+/// Runs a generated program once and returns every relation that differs from
+/// the oracle, with the engine's raw rows (duplicates kept) and the oracle's.
+/// `non_empty` collects the relations the oracle derived facts for.
+async fn all_divergences(
+    generated: &Generated,
+    non_empty: &mut HashSet<String>,
+) -> Result<Vec<String>> {
+    let db = seeded_db(generated).await?;
+    let result = db.session().locy(&generated.program_text).await?;
+    let oracle = evaluate_bags(&generated.oracle_rules);
+    let mut out = Vec::new();
+    let mut rels: Vec<&String> = generated.key_schema.keys().collect();
+    rels.sort();
+    for rel in rels {
+        let cols = &generated.key_schema[rel];
+        let mut raw: Vec<Tuple> = Vec::new();
+        for row in result.derived.get(rel.as_str()).into_iter().flatten() {
+            let mut tuple = Vec::with_capacity(cols.len());
+            for c in cols {
+                match row.get(c).and_then(|v| column_to_i64(c, v)) {
+                    Some(v) => tuple.push(v),
+                    None => {
+                        out.push(format!("{rel}.{c}: unexpected value {:?}", row.get(c)));
+                        tuple.push(i64::MIN);
+                    }
+                }
+            }
+            raw.push(tuple);
+        }
+        // Bags: a plain rule's oracle relation is a set, so an engine
+        // duplicate is a divergence; an ALONG rule's has one row per path.
+        raw.sort();
+        let want = oracle.get(rel.as_str()).cloned().unwrap_or_default();
+        if !want.is_empty() {
+            non_empty.insert(rel.clone());
+        }
+        if !bags_agree(&raw, &want, cols) {
+            out.push(format!("{rel}: engine {raw:?}\n    oracle {want:?}"));
+        }
+    }
+    Ok(out)
+}
+
+fn random_cases(default: u32) -> u32 {
+    std::env::var("ORACLE_RANDOM_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn drive_random_programs(cases: u32) {
+    use proptest::test_runner::{Config, TestCaseError, TestRunner};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let mut runner = TestRunner::new(Config {
+        cases,
+        failure_persistence: None,
+        ..Config::default()
+    });
+    // Per relation, how many cases derived any fact: a comparison over empty
+    // relations proves nothing.
+    let tally = std::cell::RefCell::new(std::collections::BTreeMap::<String, u32>::new());
+    let outcome = runner.run(&random_program_strategy(), |g| {
+        let mut non_empty = HashSet::new();
+        let diffs = rt
+            .block_on(all_divergences(&g, &mut non_empty))
+            .map_err(|e| TestCaseError::fail(format!("{e}\n{}", g.program_text)))?;
+        if diffs.is_empty() {
+            Ok(())
+        } else {
+            Err(TestCaseError::fail(format!(
+                "{}\n  program:\n{}\n  graph: {}",
+                diffs.join("\n  "),
+                g.program_text,
+                g.base_graph_cypher
+            )))
+        }
+        .inspect(|()| {
+            let mut t = tally.borrow_mut();
+            for rel in non_empty {
+                *t.entry(rel).or_default() += 1;
+            }
+        })
+    });
+    let tally = tally.into_inner();
+    eprintln!("[oracle:random] cases={cases} non-empty per relation: {tally:?}");
+    outcome.expect("a random program's derived facts diverged from the oracle");
+    for rel in [
+        "link", "reach", "un", "deg", "span", "flow", "cost", "tot", "roll", "opt", "pr", "nor",
+        "prd", "safe",
+    ] {
+        let n = tally.get(rel).copied().unwrap_or(0);
+        assert!(
+            n * 5 >= cases,
+            "relation {rel} derived facts in only {n} of {cases} cases; the comparison is too often vacuous"
+        );
+    }
+}
+
+/// Random programs over a multigraph — parallel and identical edges, self-loops,
+/// two relationship types — with recursion, stratified negation and FOLD over
+/// bags, against the oracle. The FOLD rules are where a set where a bag is due
+/// (or the reverse) would show: parallel edges must each count.
+#[test]
+fn random_programs_match_the_oracle() {
+    drive_random_programs(random_cases(96));
+}
+
+/// The same at nightly volume (`ORACLE_RANDOM_CASES`, default 5 000).
+#[test]
+#[ignore = "soak: random oracle programs at nightly volume"]
+fn random_programs_soak() {
+    drive_random_programs(random_cases(5_000));
 }

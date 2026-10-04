@@ -219,7 +219,7 @@ fn dispatch_body_command<'a>(
                         rows,
                         gq.where_expr.as_ref(),
                         &config.params,
-                    );
+                    )?;
                     let projected = super::locy_query::apply_return_clause(
                         filtered,
                         &gq.return_clause,

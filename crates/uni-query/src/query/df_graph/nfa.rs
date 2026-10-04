@@ -38,8 +38,17 @@ pub enum PathSelector {
 /// Determines the BFS strategy based on how the VLP result is consumed.
 #[derive(Clone, Debug)]
 pub enum VlpOutputMode {
-    /// No path_variable, no step_variable — only endpoints and hop count.
-    EndpointsOnly,
+    /// No path, step or group variable, and the consumer ignores row
+    /// multiplicity (see `LogicalPlan::MultiplicityInsensitive`): one row per
+    /// reachable `(endpoint, depth)`, found by BFS without enumerating paths.
+    ///
+    /// Only valid where multiplicity is irrelevant. openCypher binds one row
+    /// per matched path, so a plain `MATCH` must use [`Self::EndpointsPerPath`].
+    Reachability,
+    /// No path, step or group variable: one row per matched path, carrying
+    /// only the endpoint. The paths are enumerated but not materialized into
+    /// any output column.
+    EndpointsPerPath,
     /// Only `length(p)` or `min/max(length(p))` is used.
     LengthOnly { needs_max: bool },
     /// Only `count(p)` is used.

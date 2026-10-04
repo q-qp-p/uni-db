@@ -82,6 +82,19 @@ pub struct OptionalFilterExec {
     /// source group.
     optional_variables: HashSet<String>,
 
+    /// Columns the enclosing OPTIONAL MATCH clause created: every column of
+    /// the input that did not enter the clause. The NULL row an entering row
+    /// gets when nothing matched has all of them NULL.
+    created_columns: Vec<usize>,
+
+    /// The created columns that name an entity or a traversal step (`._vid`,
+    /// `._eid`, `__eid_to_*`, `_hop_count`). Each is non-null on a real match
+    /// and NULL on a carrier row, the row a traversal inside the clause emits
+    /// for an entering row it could not extend. A row passes only if all of
+    /// them are non-null, so a carrier is never mistaken for a match — even
+    /// one a later hop extended, or one this operator's predicate accepts.
+    evidence_columns: Vec<usize>,
+
     /// Output schema (same as input).
     schema: SchemaRef,
 
@@ -110,8 +123,9 @@ impl OptionalFilterExec {
             col_name == var
             // Match "m._vid", "m.name", etc.
             || col_name.strip_prefix(var).is_some_and(|rest| rest.starts_with('.'))
-            // Match internal EID tracking columns like "__eid_to_m"
-            || (col_name.starts_with("__eid_to_") && col_name.ends_with(var))
+            // Match the internal EID tracking column "__eid_to_m" exactly: a
+            // suffix test also claimed "__eid_to_xm" for optional var `m`.
+            || col_name.strip_prefix("__eid_to_") == Some(var)
         })
     }
 
@@ -127,14 +141,30 @@ impl OptionalFilterExec {
         optional_variables: HashSet<String>,
     ) -> Self {
         let input_schema = input.schema();
+        let created_columns = clause_created_columns(&input, &optional_variables);
+        // Only the first column of a name counts: it is the one every reader
+        // resolves by name. A later namesake can be something else — a
+        // traversal re-bound onto a relationship variable also emits
+        // `__rebound_r._eid` as a property placeholder that stays NULL.
+        let evidence_columns: Vec<usize> = created_columns
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                let name = input_schema.field(idx).name();
+                is_evidence_column(name) && input_schema.index_of(name).ok() == Some(idx)
+            })
+            .collect();
         // OptionalFilter can synthesize NULLs for optional columns even when upstream
         // declared them non-nullable (e.g., reused bound variables in OPTIONAL MATCH).
         // Ensure these columns are nullable in this operator's output schema.
         let fields: Vec<Field> = input_schema
             .fields()
             .iter()
-            .map(|f| {
-                if Self::is_optional_column_name(&optional_variables, f.name()) && !f.is_nullable()
+            .enumerate()
+            .map(|(idx, f)| {
+                if (Self::is_optional_column_name(&optional_variables, f.name())
+                    || created_columns.contains(&idx))
+                    && !f.is_nullable()
                 {
                     Field::new(f.name(), f.data_type().clone(), true)
                 } else {
@@ -149,6 +179,8 @@ impl OptionalFilterExec {
             input,
             predicate,
             optional_variables,
+            created_columns,
+            evidence_columns,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -172,6 +204,15 @@ impl OptionalFilterExec {
     /// into struct columns. The blob case handles MERGE output where variables
     /// are serialized as CypherValue blobs without separate `._vid` columns.
     fn compute_source_key_columns(&self) -> Vec<SourceKeyColumn> {
+        // The row's identity as it entered the OPTIONAL MATCH, when the planner
+        // tagged it (see `optional_source`). Grouping by node ids instead
+        // merged entering rows that differ only in a scalar or that repeat, so
+        // one passing row suppressed another row's NULL.
+        if let Some(idx) = super::optional_source::newest_source_row_column(&self.schema, |name| {
+            self.is_optional_column(name)
+        }) {
+            return vec![SourceKeyColumn::FlatVid(idx)];
+        }
         let mut result = Vec::new();
         let mut covered_vars: HashSet<String> = HashSet::new();
 
@@ -280,7 +321,9 @@ impl ExecutionPlan for OptionalFilterExec {
             .fields()
             .iter()
             .enumerate()
-            .filter(|(_, field)| self.is_optional_column(field.name()))
+            .filter(|(idx, field)| {
+                self.is_optional_column(field.name()) || self.created_columns.contains(idx)
+            })
             .map(|(idx, _)| idx)
             .collect();
 
@@ -305,6 +348,7 @@ impl ExecutionPlan for OptionalFilterExec {
             schema: Arc::clone(&self.schema),
             source_key_columns,
             optional_col_indices,
+            evidence_columns: self.evidence_columns.clone(),
             passed_keys: HashSet::new(),
             pending_null: HashMap::new(),
             pending_order: Vec::new(),
@@ -340,6 +384,10 @@ struct OptionalFilterStream {
 
     /// Indices of optional columns (nulled for filtered-out groups).
     optional_col_indices: Vec<usize>,
+
+    /// Columns that must all be non-null for a row to count as a match; see
+    /// [`OptionalFilterExec::evidence_columns`].
+    evidence_columns: Vec<usize>,
 
     /// Source groups that have already emitted at least one passing row, across
     /// every batch seen so far. A group here never needs a NULL recovery row.
@@ -398,7 +446,7 @@ impl OptionalFilterStream {
         // Evaluate the filter predicate.
         let filter_result = self.predicate.evaluate(&batch)?;
         let filter_array = filter_result.into_array(batch.num_rows())?;
-        let filter_bools = filter_array
+        let predicate_bools = filter_array
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| {
@@ -406,6 +454,14 @@ impl OptionalFilterStream {
                     "Filter predicate did not return BooleanArray".to_string(),
                 )
             })?;
+        // A carrier row is never a match, whatever the predicate says of it.
+        let mut passing = predicate_bools.clone();
+        for &idx in &self.evidence_columns {
+            let bound =
+                arrow::compute::is_not_null(batch.column(idx).as_ref()).map_err(arrow_err)?;
+            passing = arrow::compute::and(&passing, &bound).map_err(arrow_err)?;
+        }
+        let filter_bools = &passing;
 
         // Group rows by source VID values.
         // Key = serialized source VID values, Value = list of row indices.
@@ -566,6 +622,67 @@ impl OptionalFilterStream {
             }
         }
         key
+    }
+}
+
+/// Whether a column identifies an entity or a traversal step, and so is
+/// non-null on every row that really matched.
+fn is_evidence_column(name: &str) -> bool {
+    name.ends_with("._vid")
+        || name.ends_with("._eid")
+        || name.starts_with("__eid_to_")
+        || name == "_hop_count"
+}
+
+/// The input columns created inside the OPTIONAL MATCH clause this operator
+/// belongs to.
+///
+/// When the clause's entering rows were tagged (see `optional_source`), the
+/// columns that entered are exactly the tagging operator's output — its input
+/// plus the row id — and every other column was created inside the clause. The difference is taken as a
+/// multiset of names, so a column name repeated by an earlier clause (say a
+/// second `_hop_count`) still counts once for each side. Without a tag — a
+/// clause with no rows entering it, such as a leading `OPTIONAL MATCH` — the
+/// clause's own variables are the created columns.
+fn clause_created_columns(
+    input: &Arc<dyn ExecutionPlan>,
+    optional_variables: &HashSet<String>,
+) -> Vec<usize> {
+    let schema = input.schema();
+    let tag = super::optional_source::newest_source_row_column(&schema, |name| {
+        OptionalFilterExec::is_optional_column_name(optional_variables, name)
+    })
+    .and_then(|idx| super::optional_source::entering_schema(input, schema.field(idx).name()));
+    match tag {
+        Some(entering) => {
+            let mut entered: HashMap<&str, usize> = HashMap::new();
+            for field in entering.fields() {
+                *entered.entry(field.name().as_str()).or_default() += 1;
+            }
+            schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(idx, field)| match entered.get_mut(field.name().as_str()) {
+                        Some(n) if *n > 0 => {
+                            *n -= 1;
+                            None
+                        }
+                        _ => Some(idx),
+                    },
+                )
+                .collect()
+        }
+        None => schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                OptionalFilterExec::is_optional_column_name(optional_variables, f.name())
+            })
+            .map(|(idx, _)| idx)
+            .collect(),
     }
 }
 

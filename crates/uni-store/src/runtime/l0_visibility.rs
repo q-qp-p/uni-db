@@ -16,7 +16,7 @@
 use crate::runtime::context::QueryContext;
 use crate::runtime::l0::L0Buffer;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::Properties;
 use uni_common::Value;
@@ -776,5 +776,54 @@ impl L0Context {
             .iter()
             .chain(self.current_l0.iter())
             .chain(self.transaction_l0.iter())
+    }
+
+    /// The smallest vid at or above `lo` of a vertex carrying `label` in any
+    /// visible buffer, or of any vertex when `label` is `None`.
+    ///
+    /// A scan walking a label in `_vid` ranges asks flushed storage where the
+    /// label continues; unflushed rows answer here. Tombstoned vertices are
+    /// not excluded: the answer only decides where the walk looks next, and
+    /// the range scan itself drops them.
+    pub fn min_vertex_vid_at_or_above(&self, label: Option<&str>, lo: u64) -> Option<u64> {
+        self.iter_l0_buffers()
+            .filter_map(|l0| {
+                let guard = l0.read();
+                let above = |vid: &Vid| Some(vid.as_u64()).filter(|raw| *raw >= lo);
+                match label {
+                    Some(label) => guard
+                        .label_to_vids
+                        .get(label)
+                        .and_then(|vids| vids.iter().filter_map(above).min()),
+                    None => guard.vertex_properties.keys().filter_map(above).min(),
+                }
+            })
+            .min()
+    }
+
+    /// How many rows of `entity` — vertices of that label, or edges of that
+    /// type — the visible buffers hold. An upper bound, like
+    /// [`Self::vertex_count`].
+    pub fn entity_count(&self, entity: &str) -> usize {
+        let edges: usize = self
+            .iter_l0_buffers()
+            .map(|l0| l0.read().eids_for_type(entity).len())
+            .sum();
+        self.vertex_count(Some(entity)) + edges
+    }
+
+    /// How many vertices carrying `label` (any vertex when `None`) the
+    /// visible buffers hold. An upper bound: a vertex written in more than one
+    /// buffer, or also flushed, is counted each time.
+    pub fn vertex_count(&self, label: Option<&str>) -> usize {
+        self.iter_l0_buffers()
+            .map(|l0| {
+                let guard = l0.read();
+                match label {
+                    Some(label) => guard.label_to_vids.get(label).map_or(0, HashSet::len),
+                    None => guard.vertex_properties.len(),
+                }
+            })
+            .sum()
     }
 }

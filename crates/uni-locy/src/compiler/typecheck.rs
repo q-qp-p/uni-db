@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use uni_cypher::ast::{BinaryOp, Expr};
+use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr};
 use uni_cypher::locy_ast::{
     AlongBinding, FoldBinding, LocyExpr, LocyYieldItem, RuleCondition, RuleDefinition, RuleOutput,
     resolve_yield_column_names,
@@ -128,6 +128,7 @@ pub fn check(
         let is_recursive = strat.is_recursive[scc_idx];
 
         check_mixed_priority(rule_name, definitions)?;
+        check_count_fold_seed(rule_name, definitions, &mut warnings);
 
         let mut yield_schema = infer_yield_schema(rule_name, definitions)?;
 
@@ -247,6 +248,7 @@ pub fn check(
                     rule: rule_name.clone(),
                 });
             }
+            check_fold_yield_is_grouped(rule_name, def)?;
 
             // Phase B Slice 3 + A4 follow-up: extract model invocations
             // from YIELD items, ALONG bindings, and FOLD aggregate
@@ -379,6 +381,62 @@ fn check_mixed_priority(
         });
     }
     Ok(())
+}
+
+/// Warns when a clause without FOLD seeds a `COUNT` / `MCOUNT` column with a
+/// non-NULL literal. See [`WarningCode::CountFoldSeedCounted`].
+///
+/// Clauses line up by YIELD position (the rule's schema is positional), so the
+/// seed for a fold column is the item at the same index in a sibling clause.
+fn check_count_fold_seed(
+    rule_name: &str,
+    definitions: &[&RuleDefinition],
+    warnings: &mut Vec<CompilerWarning>,
+) {
+    for fold_def in definitions.iter().filter(|d| !d.fold.is_empty()) {
+        let RuleOutput::Yield(fold_yield) = &fold_def.output else {
+            continue;
+        };
+        for (idx, item) in fold_yield.items.iter().enumerate() {
+            let Expr::Variable(name) = &item.expr else {
+                continue;
+            };
+            let is_count = fold_def.fold.iter().any(|f| {
+                &f.name == name
+                    && matches!(
+                        &f.aggregate,
+                        Expr::FunctionCall { name: agg, distinct: false, .. }
+                            if agg.eq_ignore_ascii_case("COUNT")
+                                || agg.eq_ignore_ascii_case("MCOUNT")
+                    )
+            });
+            if !is_count {
+                continue;
+            }
+            let seeded = definitions.iter().filter(|d| d.fold.is_empty()).any(|d| {
+                matches!(
+                    &d.output,
+                    RuleOutput::Yield(y) if matches!(
+                        y.items.get(idx).map(|i| &i.expr),
+                        Some(Expr::Literal(lit)) if !matches!(lit, CypherLiteral::Null)
+                    )
+                )
+            });
+            if seeded {
+                warnings.push(CompilerWarning {
+                    code: WarningCode::CountFoldSeedCounted,
+                    message: format!(
+                        "a clause of rule '{rule_name}' seeds the count '{name}' with a literal. \
+                         A FOLD aggregates every row of its rule, so the seed is one counted \
+                         row, not a starting value: a key with no other rows counts 1. \
+                         Write `NULL AS {name}` to seed the key without counting it"
+                    ),
+                    rule_name: rule_name.to_string(),
+                });
+                return;
+            }
+        }
+    }
 }
 
 // ─── YIELD schema ────────────────────────────────────────────────────────────
@@ -968,6 +1026,53 @@ fn check_require_direction(
         }
     }
     Ok(())
+}
+
+/// Rejects a FOLD clause's YIELD item that is neither a KEY nor a FOLD output.
+///
+/// The FOLD emits the KEY columns plus one column per FOLD binding, and the
+/// planner evaluates an expression over a FOLD output (`total * 2.0 AS score`)
+/// after the FOLD. Any other YIELD item has nowhere to go and used to vanish
+/// from the derived relation (issue #293). Clauses without a FOLD are
+/// unconstrained: a base clause such as `YIELD KEY e, 100.0 AS agg` seeds the
+/// column a sibling clause folds into.
+fn check_fold_yield_is_grouped(
+    rule_name: &str,
+    def: &RuleDefinition,
+) -> Result<(), LocyCompileError> {
+    if def.fold.is_empty() {
+        return Ok(());
+    }
+    let RuleOutput::Yield(yc) = &def.output else {
+        return Ok(());
+    };
+    let fold_names: HashSet<&str> = def.fold.iter().map(|f| f.name.as_str()).collect();
+    let names = resolve_yield_column_names(&yc.items);
+    for (item, column) in yc.items.iter().zip(names) {
+        if item.is_key
+            || fold_names.contains(column.as_str())
+            || expr_mentions_any(&item.expr, &fold_names)
+        {
+            continue;
+        }
+        return Err(LocyCompileError::UngroupedFoldYield {
+            rule: rule_name.to_string(),
+            column,
+        });
+    }
+    Ok(())
+}
+
+/// Whether `expr` contains a variable whose name is in `names`.
+fn expr_mentions_any(expr: &Expr, names: &HashSet<&str>) -> bool {
+    if let Expr::Variable(v) = expr
+        && names.contains(v.as_str())
+    {
+        return true;
+    }
+    let mut found = false;
+    expr.for_each_child(&mut |child| found = found || expr_mentions_any(child, names));
+    found
 }
 
 /// The FOLD binding an expression names, if the expression is exactly that

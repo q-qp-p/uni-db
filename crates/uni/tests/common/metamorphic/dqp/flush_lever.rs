@@ -159,6 +159,43 @@ fn flush_smoke() {
     );
 }
 
+/// PR lane: the same transition over [`Tier::Wide`], where `Person` spans more
+/// than one scan slice and its vids have gaps, so the delta sits past both.
+///
+/// Every other tier keeps a label inside one slice with contiguous vids, which
+/// is why no lever caught a chunked scan dropping L0 rows past a vid gap
+/// (`bugs::scan_range_walk_l0_rows`).
+///
+/// Validated against a reversal of that fix: the run fails on its first case
+/// (5 083 rows before the flush, 5 190 after). It needs the tier's 65 536-row
+/// filler gap — with only the interleaved company gaps, narrower than the
+/// walk's range, the reversal passed.
+///
+/// 100 cases rather than the smoke default: a case costs about 0.4 s here, and
+/// the full suite runs it under load within the default profile's 180 s limit.
+#[test]
+fn flush_wide_smoke() {
+    drive_stateful(
+        super::driver::smoke_cases().min(100),
+        Tier::Wide,
+        CaseKind::Plain,
+        FlushLever::prepared,
+    );
+}
+
+/// Nightly volume over the wide tier: a tenth of the soak count (about seven
+/// minutes at the nightly 10 000).
+#[test]
+#[ignore = "soak: DQP L0-union vs flushed over the wide tier at nightly volume"]
+fn flush_wide_soak() {
+    drive_stateful(
+        (super::driver::soak_cases() / 10).max(1),
+        Tier::Wide,
+        CaseKind::Plain,
+        FlushLever::prepared,
+    );
+}
+
 /// Nightly volume over plain projections.
 #[test]
 #[ignore = "soak: DQP L0-union vs flushed at nightly volume"]

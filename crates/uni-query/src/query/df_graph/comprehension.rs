@@ -40,6 +40,10 @@ pub struct ListComprehensionExecExpr {
     /// expressions read those columns, and they are flattened with the same
     /// offsets as the elements so element `i` lines up with endpoint `i`.
     endpoint_lists: Option<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)>,
+    /// Outer columns the map, predicate and endpoint expressions read, exposed
+    /// as children so a projection above keeps them (see
+    /// `common::outer_column_refs`).
+    outer_refs: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl Clone for ListComprehensionExecExpr {
@@ -53,6 +57,7 @@ impl Clone for ListComprehensionExecExpr {
             output_item_type: self.output_item_type.clone(),
             needs_vid_extraction: self.needs_vid_extraction,
             endpoint_lists: self.endpoint_lists.clone(),
+            outer_refs: self.outer_refs.clone(),
         }
     }
 }
@@ -82,6 +87,13 @@ impl ListComprehensionExecExpr {
         input_schema: Arc<Schema>,
         output_item_type: DataType,
     ) -> Self {
+        let mut hidden: Vec<&Arc<dyn PhysicalExpr>> = vec![&map_expr];
+        hidden.extend(predicate.iter());
+        if let Some((src, dst)) = &bindings.endpoint_lists {
+            hidden.extend([src, dst]);
+        }
+        let outer_refs =
+            super::common::outer_column_refs(&hidden, &input_schema, &[&bindings.variable_name]);
         Self {
             input_list,
             map_expr,
@@ -91,6 +103,7 @@ impl ListComprehensionExecExpr {
             output_item_type,
             needs_vid_extraction: bindings.needs_vid_extraction,
             endpoint_lists: bindings.endpoint_lists,
+            outer_refs,
         }
     }
 }
@@ -155,6 +168,10 @@ impl PhysicalExpr for ListComprehensionExecExpr {
         // 1. Evaluate input list
         let list_val = self.input_list.evaluate(batch)?;
         let list_array = list_val.into_array(batch.num_rows())?;
+        // The list is a child, renumbered for this batch by any projection
+        // above; the map, predicate and endpoint expressions read the input by
+        // its compiled layout.
+        let batch = &super::common::realign_by_name(batch, &self.input_schema)?;
 
         // 2. Decode CypherValue-encoded arrays (LargeBinary → LargeList<LargeBinary>)
         let list_array = if let DataType::LargeBinary = list_array.data_type() {
@@ -367,17 +384,20 @@ impl PhysicalExpr for ListComprehensionExecExpr {
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         // Only expose input_list as a child. The map_expr and predicate are compiled
         // against an inner schema (with the loop variable) and should not be exposed
-        // to DataFusion's expression tree traversal (e.g., equivalence analysis).
-        vec![&self.input_list]
+        // to DataFusion's expression tree traversal (e.g., equivalence analysis);
+        // the outer columns they read are, so they are not projected away.
+        let mut children = vec![&self.input_list];
+        children.extend(self.outer_refs.iter());
+        children
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        if children.len() != 1 {
+        if children.len() != 1 + self.outer_refs.len() {
             return Err(datafusion::error::DataFusionError::Internal(
-                "ListComprehension requires exactly 1 child (input_list)".to_string(),
+                "ListComprehension requires its input_list and outer column children".to_string(),
             ));
         }
 
@@ -390,6 +410,7 @@ impl PhysicalExpr for ListComprehensionExecExpr {
             output_item_type: self.output_item_type.clone(),
             needs_vid_extraction: self.needs_vid_extraction,
             endpoint_lists: self.endpoint_lists.clone(),
+            outer_refs: children[1..].to_vec(),
         }))
     }
 

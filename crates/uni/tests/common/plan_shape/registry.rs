@@ -223,6 +223,14 @@ pub const OPERATORS: &[Operator] = &[
         },
     },
     Operator {
+        ty: "OptionalSourceRowIdExec",
+        runtime_name: "OptionalSourceRowIdExec",
+        status: Status::Proven {
+            by: "an_optional_match_tags_its_entering_rows",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
+    },
+    Operator {
         ty: "OptionalFilterExec",
         runtime_name: "OptionalFilterExec",
         status: Status::Proven {
@@ -291,9 +299,12 @@ pub const OPERATORS: &[Operator] = &[
     Operator {
         ty: "GraphExtIdLookupExec",
         runtime_name: "GraphExtIdLookupExec",
-        status: Status::Proven {
-            by: "an_unlabelled_ext_id_match_runs_the_ext_id_lookup",
-            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        status: Status::Unreachable {
+            reason: "Retired 2026-09-28: an unlabelled `(n {ext_id: ...})` now plans as a \
+                     schemaless ScanAll with the ext_id equality pushed to the main table's \
+                     index. The dedicated lookup read flushed rows only, projected no \
+                     properties and stringified every value; delete it with \
+                     `LogicalPlan::ExtIdLookup` once nothing external depends on the variant.",
         },
     },
     Operator {

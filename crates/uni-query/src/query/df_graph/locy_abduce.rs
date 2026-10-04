@@ -25,7 +25,7 @@ use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 use super::locy_delta::RowStore;
 
 use super::locy_ast_builder::value_to_expr;
-use super::locy_eval::eval_expr;
+use super::locy_eval::eval_condition;
 use super::locy_explain::{ProvenanceStore, explain_rule};
 use super::locy_traits::LocyExecutionContext;
 
@@ -54,12 +54,9 @@ pub async fn evaluate_abduce(
     let matching: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
         facts
             .into_iter()
-            .filter(|row| {
-                eval_expr(where_expr, row)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            })
-            .collect()
+            .map(|row| Ok(eval_condition(where_expr, &row, "ABDUCE WHERE")?.then_some(row)))
+            .filter_map(Result::transpose)
+            .collect::<Result<_, LocyError>>()?
     } else {
         facts
     };
@@ -358,12 +355,9 @@ async fn validate_modification(
     let matching: Vec<FactRow> = if let Some(where_expr) = where_expr {
         facts
             .into_iter()
-            .filter(|row| {
-                eval_expr(where_expr, row)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            })
-            .collect()
+            .map(|row| Ok(eval_condition(where_expr, &row, "ABDUCE WHERE")?.then_some(row)))
+            .filter_map(Result::transpose)
+            .collect::<Result<_, LocyError>>()?
     } else {
         facts
     };

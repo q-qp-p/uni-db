@@ -149,3 +149,43 @@ async fn locy_generator_binds_and_explodes_in_rule_body() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// A `QUERY ... WHERE key = literal` over a generator rule (resolved by the SLG
+/// path) keeps the rows Locy's `=` keeps. The goal binding compared the key by
+/// structural `==`, so `k = 3.0` against an integer `k` matched nothing and the
+/// query silently returned no rows (W6).
+#[tokio::test]
+async fn locy_generator_goal_binding_uses_value_equality() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.add_plugin(GeneratorPlugin {
+        manifest: OnceLock::new(),
+    })?;
+    db.schema()
+        .label("Cnt")
+        .property("k", DataType::Int64)
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Cnt {k: 3}), (:Cnt {k: 2})").await?;
+    tx.commit().await?;
+
+    for filter in ["k = 3", "k = 3.0", "3.0 = k"] {
+        let program = format!(
+            "CREATE RULE idx AS \
+             MATCH (n:Cnt) WHERE myplugin.range(n.k) -> (i) YIELD KEY n.k AS k, KEY i AS i\n\
+             QUERY idx WHERE {filter} RETURN k, i"
+        );
+        let result = session.locy(&program).await?;
+        let empty = vec![];
+        let mut is: Vec<i64> = result
+            .rows()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|r| r.get("i").and_then(uni_db::Value::as_i64))
+            .collect();
+        is.sort();
+        assert_eq!(is, vec![0, 1, 2], "{filter}");
+    }
+    Ok(())
+}

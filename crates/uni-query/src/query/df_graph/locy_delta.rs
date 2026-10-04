@@ -16,7 +16,7 @@ use uni_locy::{FactRow, LocyError};
 
 use super::locy_ast_builder::expr_references_var;
 use super::locy_eval::{
-    eval_expr, eval_locy_expr, record_batches_to_locy_rows, values_equal_for_join,
+    eval_condition, eval_locy_expr, record_batches_to_locy_rows, values_equal_for_join,
 };
 use super::locy_traits::DerivedFactSource;
 
@@ -403,13 +403,16 @@ pub async fn resolve_clause_with_is_refs(
 
     // Apply target-dependent Cypher conditions.
     if !target_dependent.is_empty() {
-        rows.retain(|row| {
-            target_dependent.iter().all(|expr| {
-                eval_expr(expr, row)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            })
-        });
+        let mut kept = Vec::with_capacity(rows.len());
+        'rows: for row in rows {
+            for expr in &target_dependent {
+                if !eval_condition(expr, &row, "rule WHERE")? {
+                    continue 'rows;
+                }
+            }
+            kept.push(row);
+        }
+        rows = kept;
     }
 
     // Evaluate ALONG expressions (using __prev_* stash for PrevRef lookups).

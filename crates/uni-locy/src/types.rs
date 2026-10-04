@@ -327,6 +327,16 @@ pub enum WarningCode {
     /// Still fires when a rule carries both: a `REQUIRE` alongside a post-FOLD
     /// `WHERE` does not make the `WHERE` any less post-fixpoint.
     HavingInRecursivePath,
+    /// A clause with no FOLD seeds a `COUNT` / `MCOUNT` column with a non-NULL
+    /// literal (`YIELD KEY e, 0 AS n` beside `FOLD n = MCOUNT(r)`).
+    ///
+    /// A FOLD aggregates every row of its rule, so the seed is one counted row
+    /// and the key comes out as 1, not 0 — the value itself is never read, as
+    /// with SQL's `COUNT` over a `UNION ALL`. That is consistent with how a seed
+    /// feeds `MSUM` (its value is added), but a literal seed into a count reads
+    /// like a starting value, so it warns. `NULL AS n` seeds the key without
+    /// counting it.
+    CountFoldSeedCounted,
 }
 
 impl WarningCode {
@@ -364,6 +374,7 @@ impl WarningCode {
             WarningCode::CrossPredicateCorrelation => "cross_predicate_correlation",
             WarningCode::SharedRetrievalContext => "shared_retrieval_context",
             WarningCode::HavingInRecursivePath => "having_in_recursive_path",
+            WarningCode::CountFoldSeedCounted => "count_fold_seed_counted",
         }
     }
 }
@@ -499,6 +510,7 @@ mod tests {
         WarningCode::CrossPredicateCorrelation,
         WarningCode::SharedRetrievalContext,
         WarningCode::HavingInRecursivePath,
+        WarningCode::CountFoldSeedCounted,
     ];
 
     #[test]

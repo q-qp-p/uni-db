@@ -4,7 +4,7 @@ This document lists every CI job from `.github/workflows/pr.yml` and `.github/wo
 with the **exact command** to run it locally, plus prerequisites, ordering, and the local-only
 gotchas that bite.
 
-> **Source of truth = the workflow YAML.** This runbook mirrors the workflows as of 2026-09-16.
+> **Source of truth = the workflow YAML.** This runbook mirrors the workflows as of 2026-10-03.
 > If a command here disagrees with `.github/workflows/{pr,ci}.yml`, the YAML wins — update this doc.
 > **Bump the date above whenever you add a job or change a command.** The stamp is how drift gets
 > noticed: it sat at 2026-07-26 through four later edits while three PR-blocking jobs went
@@ -60,6 +60,8 @@ tarball (reranker load-dynamic), and the LocalStack image (cloud).
 # CI runs with NO rustc wrapper. If you have a global sccache/RUSTC_WRAPPER configured locally,
 # unset it for every cargo/maturin command or the build can fail. Prefix commands with:
 export RUSTC_WRAPPER=""
+# Both workflows also set this at workflow level:
+export RUST_BACKTRACE=1
 ```
 
 ### Ordering / contention
@@ -90,7 +92,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace \
   --exclude uni-python-cuda --exclude uni-python-metal \
   --exclude uni-python-onnx-cuda --exclude uni-python-onnx-metal
 ./scripts/build-wasm-fixtures.sh
-cargo nextest run --workspace \
+cargo nextest run --workspace --no-fail-fast \
   --exclude uni-tck --exclude uni-python --exclude uni-python-onnx \
   --exclude uni-python-cuda --exclude uni-python-metal \
   --exclude uni-python-onnx-cuda --exclude uni-python-onnx-metal
@@ -124,6 +126,8 @@ change to this repo** — see §5.
 ```bash
 # working dir: fuzz (subshell, so a failure does not leave you outside the repo root)
 ( cd fuzz
+# The fuzz crate's own lockfile must be current; the job checks it first.
+cargo +nightly metadata --locked --format-version 1 > /dev/null
 for target in cypher_parse locy_parse wal_decode btic_decode; do
   # Corpus-dir order is load-bearing. libFuzzer writes newly-discovered inputs
   # into the FIRST directory listed and treats the rest as read-only, so
@@ -149,7 +153,7 @@ corpus is the real regression check — 30 s of blind mutation mostly is not.
 ### Rust Tests (workspace suite)
 ```bash
 ./scripts/build-wasm-fixtures.sh      # builds the geo/net example wasm plugin fixtures first
-cargo nextest run --workspace \
+cargo nextest run --workspace --no-fail-fast \
   --exclude uni-tck --exclude uni-python --exclude uni-python-onnx \
   --exclude uni-python-cuda --exclude uni-python-metal \
   --exclude uni-python-onnx-cuda --exclude uni-python-onnx-metal
@@ -271,6 +275,7 @@ crate from the lane.
 # RUNS=5 is measured, not chosen: against a 25-sample cross-runner set the worst
 # drift of a median with NO code change is 0.997% at 3 runs and 0.599% at 5;
 # 7 runs only reaches 0.581% for another 4.6 minutes.
+RUSTC_WRAPPER="" cargo bench -p uni-db --bench hot_paths_iai --no-run   # the job's build step
 bash scripts/perf/iai_pilot.sh 5
 
 # The gate and the collector verify themselves in the same run that trusts them.
@@ -292,8 +297,8 @@ python3 scripts/perf/iai_gate.py \
   --fail-pct 2 --warn-pct 1 --fail-improve-pct 50 --markdown
 ```
 Expect ~15 min of cold compile (no other lane builds `--benches`) plus ~12 min of
-measurement. The job's 45-minute `timeout-minutes` is the ceiling that budget sits
-under, not the expected runtime.
+measurement. The job's 75-minute `timeout-minutes` (40 for the build step, 30 for
+measurement) is the ceiling that budget sits under, not the expected runtime.
 
 **This lane does not reproduce off a CI runner — see §5 before believing its
 result.**
@@ -311,6 +316,10 @@ cargo nextest run -p uni-tck --test tck
   uv run maturin develop
   uv run ruff format --check .
   uv run ruff check .
+  # The stub must match the extension module (stubtest imports the built .so).
+  uv run python -m mypy.stubtest uni_db --mypy-config-file stubtest-mypy.ini \
+    --allowlist stubtest-allowlist.txt --ignore-unused-allowlist \
+    --ignore-positional-only --ignore-disjoint-bases
   uv run pytest tests/ -v -n auto )
 
 # pyo3 loader Rust tests — these exist ONLY under `--features pyo3`, and every file in
@@ -347,6 +356,7 @@ python3 scripts/ci/check_documented_counts.py     # every documented count claim
                                                   # and the skill reference pages
 python3 scripts/gen_python_api_reference.py --check  # generated symbol page is current
 python3 scripts/ci/check_doc_symbols.py           # documented Python methods exist in __init__.pyi
+python3 scripts/ci/check_rust_python_parity.py    # every UniConfig field reachable from Python
 ```
 
 If `gen_python_api_reference.py --check` fails, regenerate rather than hand-editing:
@@ -481,6 +491,10 @@ missing = [m for m in ('load_wasm_component', 'load_wasm_extism')
            if not hasattr(ext.Uni, m)]
 sys.exit('feature build did not take effect; missing: %r' % missing) if missing else None
 "
+  # stubtest again, against the feature build.
+  uv run python -m mypy.stubtest uni_db --mypy-config-file stubtest-mypy.ini \
+    --allowlist stubtest-allowlist.txt --ignore-unused-allowlist \
+    --ignore-positional-only --ignore-disjoint-bases
   uv run pytest tests/test_wasm_plugin.py tests/test_plugin_conformance.py \
     tests/test_stub_drift.py -v
   # Restore the default-feature wheel for any later local step.

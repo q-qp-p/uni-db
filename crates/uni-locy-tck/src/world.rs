@@ -123,6 +123,7 @@ impl LocyWorld {
             ..Default::default()
         };
         config.compaction.enabled = false; // Disable background compaction
+        apply_execution_overrides(&mut config);
 
         let db = Uni::in_memory().config(config).build().await?;
         let run_ctx = get_tck_run_context_for_current_thread();
@@ -200,5 +201,26 @@ impl LocyWorld {
             .command_results
             .get(idx)
             .unwrap_or_else(|| panic!("No command result at index {}", idx))
+    }
+}
+
+/// Applies `UNI_TCK_PARALLELISM` and `UNI_TCK_EXECUTION_BATCH_SIZE`, when set.
+///
+/// Both knobs are result-neutral, so the suite must pass unchanged under any
+/// value; running it with a single partition and a tiny engine batch is a
+/// determinism check that reuses every scenario's expected result. A value
+/// that does not parse fails loudly rather than silently running the defaults.
+fn apply_execution_overrides(config: &mut uni_common::UniConfig) {
+    let read = |name: &str| {
+        std::env::var(name).ok().map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {v:?}"))
+        })
+    };
+    if let Some(p) = read("UNI_TCK_PARALLELISM") {
+        config.parallelism = p;
+    }
+    if let Some(b) = read("UNI_TCK_EXECUTION_BATCH_SIZE") {
+        config.execution_batch_size = Some(b);
     }
 }

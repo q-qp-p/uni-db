@@ -883,8 +883,7 @@ impl GraphTraverseStream {
         let bound_target_vids: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Collect edge ID arrays from previous hops for relationship uniqueness filtering.
-        let used_edge_arrays: Vec<&UInt64Array> =
-            super::common::used_edge_id_arrays(batch, &self.used_edge_columns)?;
+        let used_edge_arrays = super::common::used_edge_id_arrays(batch, &self.used_edge_columns)?;
 
         let mut expanded_rows: Vec<Expansion> = Vec::new();
         let is_undirected = matches!(self.direction, Direction::Both);
@@ -913,16 +912,7 @@ impl GraphTraverseStream {
             });
 
             // Collect used edge IDs for this row from all previous hops
-            let used_eids: HashSet<u64> = used_edge_arrays
-                .iter()
-                .filter_map(|arr| {
-                    if arr.is_null(row_idx) {
-                        None
-                    } else {
-                        Some(arr.value(row_idx))
-                    }
-                })
-                .collect();
+            let used_eids: HashSet<u64> = used_edge_arrays.for_row(row_idx).collect();
 
             let vid = Vid::from(src);
             // For Direction::Both, deduplicate edges by eid within each source.
@@ -1652,7 +1642,7 @@ fn build_optional_null_batch_for_rows(
     RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
-fn is_optional_column_for_vars(col_name: &str, optional_vars: &HashSet<String>) -> bool {
+pub(crate) fn is_optional_column_for_vars(col_name: &str, optional_vars: &HashSet<String>) -> bool {
     optional_vars.contains(col_name)
         || optional_vars.iter().any(|var| {
             // `var.` property columns (e.g. `x.name`), and the exact internal
@@ -1732,6 +1722,16 @@ fn source_group_key_columns(
     schema: &SchemaRef,
     optional_vars: &HashSet<String>,
 ) -> Vec<OptionalGroupKeyColumn> {
+    // The row's identity as it entered the OPTIONAL MATCH, when the planner
+    // tagged it (see `optional_source`). Node ids alone merge entering rows
+    // that bind the same node but differ elsewhere, or repeat.
+    if let Some(idx) = super::optional_source::newest_source_row_column(schema, |name| {
+        is_optional_column_for_vars(name, optional_vars)
+    }) && idx < input.num_columns()
+    {
+        return vec![OptionalGroupKeyColumn::FlatVid(idx)];
+    }
+
     let mut cols = Vec::new();
     let mut covered: HashSet<String> = HashSet::new();
 
@@ -2043,11 +2043,50 @@ impl Stream for GraphTraverseStream {
                     offset,
                 } => {
                     if offset >= expansions.len() {
+                        // The chunks carry matches only. Which input rows
+                        // matched nothing is a property of the whole expansion
+                        // set, so their NULL rows are decided here, once:
+                        // decided per chunk, every row whose matches fell in
+                        // another chunk got a NULL row too, once per chunk.
+                        let unmatched = if self.optional {
+                            let matched: HashSet<usize> =
+                                expansions.iter().map(|(idx, _, _, _, _)| *idx).collect();
+                            collect_unmatched_optional_group_rows(
+                                &input,
+                                &matched,
+                                &self.schema,
+                                &self.optional_pattern_vars,
+                            )
+                            .and_then(|rows| {
+                                (!rows.is_empty())
+                                    .then(|| {
+                                        build_optional_null_batch_for_rows_with_optional_vars(
+                                            &input,
+                                            &rows,
+                                            &self.schema,
+                                            &self.optional_pattern_vars,
+                                        )
+                                    })
+                                    .transpose()
+                            })
+                        } else {
+                            Ok(None)
+                        };
                         // The expansion set and its input die here, so what they
                         // backed is released here.
                         self.reservation.free();
                         self.state = TraverseStreamState::Reading;
-                        continue;
+                        match unmatched {
+                            Ok(Some(nulls)) => {
+                                self.metrics.record_output(nulls.num_rows());
+                                return Poll::Ready(Some(Ok(nulls)));
+                            }
+                            Ok(None) => continue,
+                            Err(e) => {
+                                self.state = TraverseStreamState::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        }
                     }
                     let end = (offset + self.slice_size).min(expansions.len());
                     let chunk: Vec<Expansion> = expansions[offset..end].to_vec();
@@ -2061,7 +2100,9 @@ impl Stream for GraphTraverseStream {
                         self.target_properties.clone(),
                         self.target_label_name.clone(),
                         self.graph_ctx.clone(),
-                        self.optional,
+                        // NULL rows for unmatched input rows are added once the
+                        // last chunk is out, above.
+                        false,
                         self.optional_pattern_vars.clone(),
                         self.target_props.clone(),
                         self.target_props_map.clone(),
@@ -2829,8 +2870,7 @@ impl GraphTraverseMainStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Collect edge ID arrays from previous hops for relationship uniqueness filtering.
-        let used_edge_arrays: Vec<&UInt64Array> =
-            super::common::used_edge_id_arrays(input, &self.used_edge_columns)?;
+        let used_edge_arrays = super::common::used_edge_id_arrays(input, &self.used_edge_columns)?;
 
         // Build expansions:
         // (input_row_idx, target_vid, eid, edge_type, edge_props, is_fwd).
@@ -2844,16 +2884,7 @@ impl GraphTraverseMainStream {
                 let src_vid = Vid::from(src_u64);
 
                 // Collect used edge IDs for this row from all previous hops
-                let used_eids: HashSet<u64> = used_edge_arrays
-                    .iter()
-                    .filter_map(|arr| {
-                        if arr.is_null(row_idx) {
-                            None
-                        } else {
-                            Some(arr.value(row_idx))
-                        }
-                    })
-                    .collect();
+                let used_eids: HashSet<u64> = used_edge_arrays.for_row(row_idx).collect();
 
                 if let Some(neighbors) = adjacency.get(&src_vid) {
                     for (target_vid, eid, edge_type, props, is_fwd) in neighbors {
@@ -4084,7 +4115,12 @@ impl GraphVariableLengthTraverseExec {
         }
 
         // Add hop count
-        fields.push(Field::new("_hop_count", DataType::UInt64, false));
+        // Nullable: an OPTIONAL carrier row (no path matched) has no hop
+        // count, and a NULL here is what lets the clause's closing
+        // `OptionalFilterExec` tell it from a zero-hop match when the
+        // traversal introduces no other identity column (an anonymous
+        // relationship into an already-bound node).
+        fields.push(Field::new("_hop_count", DataType::UInt64, true));
 
         // Add step variable (edge list) if bound
         if let Some(step_var) = step_variable {
@@ -4789,10 +4825,12 @@ impl GraphVariableLengthTraverseExecData {
         Ok(results)
     }
 
-    /// NFA-driven BFS returning only endpoints and depths (Mode A).
+    /// NFA-driven BFS returning each reachable endpoint once per depth.
     ///
-    /// More efficient when no path/step variable is bound — skips full path enumeration.
-    /// Uses lightweight trail verification via has_trail_valid_path().
+    /// Serves [`VlpOutputMode::Reachability`] only: it answers *whether* a
+    /// trail reaches an endpoint, not *how many* do, so it is correct only
+    /// where the consumer ignores multiplicity. Uses lightweight trail
+    /// verification via `has_trail_valid_path()`.
     fn bfs_endpoints_only(
         &self,
         source: Vid,
@@ -4821,6 +4859,7 @@ impl GraphVariableLengthTraverseExecData {
             depth += 1;
             let mut next_frontier: Vec<(Vid, NfaStateId)> = Vec::new();
             let mut seen_at_depth: FxHashSet<(Vid, NfaStateId)> = FxHashSet::default();
+            let mut accepting: Vec<(Vid, NfaStateId)> = Vec::new();
 
             for &(vid, state) in &frontier {
                 for (neighbor, eid, dst_state) in
@@ -4830,16 +4869,25 @@ impl GraphVariableLengthTraverseExecData {
 
                     if seen_at_depth.insert((neighbor, dst_state)) {
                         next_frontier.push((neighbor, dst_state));
-
-                        // Check if accepting with trail verification
                         if nfa.is_accepting(dst_state)
                             && self.check_target_label(neighbor)
                             && vid_filter.contains(neighbor)
-                            && dag.has_trail_valid_path(source, neighbor, dst_state, depth, depth)
                         {
-                            results.push((neighbor, depth));
+                            accepting.push((neighbor, dst_state));
                         }
                     }
+                }
+            }
+
+            // Trail validity is decided only once every predecessor at this
+            // depth is recorded. Checking at first discovery saw whichever
+            // predecessor the frontier happened to reach first; if that one's
+            // path reused an edge the endpoint was dropped for good, although a
+            // predecessor added later in the same depth had a valid trail — a
+            // silent, order-dependent miss (undirected hops made it common).
+            for (neighbor, state) in accepting {
+                if dag.has_trail_valid_path(source, neighbor, state, depth, depth) {
+                    results.push((neighbor, depth));
                 }
             }
 
@@ -5359,7 +5407,7 @@ impl GraphVariableLengthTraverseStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Extract used edge columns for cross-pattern relationship uniqueness
-        let used_edge_arrays: Vec<&UInt64Array> =
+        let used_edge_arrays =
             super::common::used_edge_id_arrays(&batch, &self.exec.used_edge_columns)?;
 
         // Collect all BFS results. `budget` spans the whole batch: the limit is
@@ -5376,20 +5424,11 @@ impl GraphVariableLengthTraverseStream {
                 let vid = Vid::from(src);
 
                 // Collect used edge IDs from previous hops for this row
-                let used_eids: FxHashSet<u64> = used_edge_arrays
-                    .iter()
-                    .filter_map(|arr| {
-                        if arr.is_null(row_idx) {
-                            None
-                        } else {
-                            Some(arr.value(row_idx))
-                        }
-                    })
-                    .collect();
+                let used_eids: FxHashSet<u64> = used_edge_arrays.for_row(row_idx).collect();
 
                 // Dispatch to appropriate BFS mode based on output_mode
                 match &self.exec.output_mode {
-                    VlpOutputMode::EndpointsOnly => {
+                    VlpOutputMode::Reachability => {
                         let endpoints = self.exec.bfs_endpoints_only(
                             vid,
                             eid_filters,
@@ -5642,9 +5681,9 @@ impl GraphVariableLengthTraverseStream {
         }
 
         // Add hop count column
-        let hop_counts: Vec<u64> = expansions
+        let hop_counts: Vec<Option<u64>> = expansions
             .iter()
-            .map(|(_, _, hops, _, _)| *hops as u64)
+            .map(|(_, vid, hops, _, _)| (vid.as_u64() != u64::MAX).then_some(*hops as u64))
             .collect();
         columns.push(Arc::new(UInt64Array::from(hop_counts)));
 
@@ -6162,7 +6201,12 @@ impl GraphVariableLengthTraverseMainExec {
         }
 
         // Add hop count
-        fields.push(Field::new("_hop_count", DataType::UInt64, false));
+        // Nullable: an OPTIONAL carrier row (no path matched) has no hop
+        // count, and a NULL here is what lets the clause's closing
+        // `OptionalFilterExec` tell it from a zero-hop match when the
+        // traversal introduces no other identity column (an anonymous
+        // relationship into an already-bound node).
+        fields.push(Field::new("_hop_count", DataType::UInt64, true));
 
         // Add step variable column (list of edge structs) if bound
         // This is the relationship variable like `r` in `[r*1..3]`
@@ -6493,8 +6537,7 @@ impl GraphVariableLengthTraverseMainStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Extract used edge columns for cross-pattern relationship uniqueness
-        let used_edge_arrays: Vec<&UInt64Array> =
-            super::common::used_edge_id_arrays(&batch, &self.used_edge_columns)?;
+        let used_edge_arrays = super::common::used_edge_id_arrays(&batch, &self.used_edge_columns)?;
 
         // Collect BFS results: (original_row_idx, target_vid, hop_count, node_path, edge_path)
         let mut expansions: Vec<ExpansionRecord> = Vec::new();
@@ -6506,16 +6549,7 @@ impl GraphVariableLengthTraverseMainStream {
                 let source = Vid::from(source_u64);
 
                 // Collect used edge IDs from previous hops for this row
-                let used_eids: FxHashSet<u64> = used_edge_arrays
-                    .iter()
-                    .filter_map(|arr| {
-                        if arr.is_null(row_idx) {
-                            None
-                        } else {
-                            Some(arr.value(row_idx))
-                        }
-                    })
-                    .collect();
+                let used_eids: FxHashSet<u64> = used_edge_arrays.for_row(row_idx).collect();
 
                 let bfs_results = self.bfs(source, adjacency, &used_eids);
 
@@ -6680,9 +6714,9 @@ impl GraphVariableLengthTraverseMainStream {
         }
 
         // Add hop count column
-        let hop_counts: Vec<u64> = expansions
+        let hop_counts: Vec<Option<u64>> = expansions
             .iter()
-            .map(|(_, _, hops, _, _)| *hops as u64)
+            .map(|(_, vid, hops, _, _)| (vid.as_u64() != u64::MAX).then_some(*hops as u64))
             .collect();
         columns.push(Arc::new(UInt64Array::from(hop_counts)));
 

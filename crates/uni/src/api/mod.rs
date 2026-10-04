@@ -2147,8 +2147,10 @@ impl UniBuilder {
             // allocation behind #184) never asks, so it is still unbounded.
             // This makes the limit real where DataFusion cooperates; it is not
             // a fix for #184.
+            let session_config =
+                uni_query::query::executor::read::datafusion_session_config(&self.config);
             let ctx = if self.config.max_query_memory == 0 {
-                datafusion::execution::context::SessionContext::new()
+                datafusion::execution::context::SessionContext::new_with_config(session_config)
             } else {
                 let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
                     .with_memory_pool(Arc::new(
@@ -2159,7 +2161,7 @@ impl UniBuilder {
                     .build_arc()
                     .map_err(|e| UniError::Internal(anyhow::anyhow!(e)))?;
                 datafusion::execution::context::SessionContext::new_with_config_rt(
-                    datafusion::execution::context::SessionConfig::new(),
+                    session_config,
                     runtime,
                 )
             };

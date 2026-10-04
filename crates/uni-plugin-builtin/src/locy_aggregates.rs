@@ -400,12 +400,14 @@ impl LocyAggregate for MSumAgg {
     }
 }
 
-/// Sum state. `has_value` tracks non-null presence so an empty/all-null
-/// group finalizes to `NULL` (matching the executor's `sum_f64` → `None`).
+/// Sum state.
+///
+/// A group with no non-null value sums to 0.0, as Cypher's `sum` does: the
+/// same aggregate means the same thing in both languages. It used to finalise
+/// to NULL there.
 #[derive(Debug, Default)]
 struct SumState {
     value: f64,
-    has_value: bool,
 }
 
 impl LocyAggState for SumState {
@@ -422,12 +424,11 @@ impl LocyAggState for SumState {
             if col.is_null(i) {
                 continue;
             }
-            // #233 Tier 1: `has_value` used to be set before the read, so an
-            // unreadable cell made SUM report 0.0 instead of null or an error.
+            // #233 Tier 1: an unreadable cell is an error, never silently
+            // skipped — a sum of nothing is 0.0, so skipping would hide it.
             let Some(v) = numeric_at(col, i) else {
                 return Err(unreadable_cell("SUM", col));
             };
-            self.has_value = true;
             self.value += v;
         }
         Ok(())
@@ -435,15 +436,10 @@ impl LocyAggState for SumState {
     fn merge(&mut self, other: &dyn LocyAggState) -> Result<(), FnError> {
         let o = downcast_state::<SumState>(other)?;
         self.value += o.value;
-        self.has_value |= o.has_value;
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue, FnError> {
-        if self.has_value {
-            Ok(ScalarValue::Float64(Some(self.value)))
-        } else {
-            Ok(ScalarValue::Float64(None))
-        }
+        Ok(ScalarValue::Float64(Some(self.value)))
     }
 }
 
@@ -1024,6 +1020,15 @@ fn numeric_at(col: &dyn Array, i: usize) -> Option<f64> {
         DataType::UInt32 => Some(f64::from(col.as_primitive::<UInt32Type>().value(i))),
         DataType::UInt16 => Some(f64::from(col.as_primitive::<UInt16Type>().value(i))),
         DataType::UInt8 => Some(f64::from(col.as_primitive::<UInt8Type>().value(i))),
+        // A dynamically typed (CypherValue) cell holding a number: a schemaless
+        // property, or an ALONG column over one. Anything else stays unreadable.
+        DataType::LargeBinary => {
+            match uni_common::cypher_value_codec::decode(col.as_binary::<i64>().value(i)) {
+                Ok(uni_common::Value::Int(n)) => Some(n as f64),
+                Ok(uni_common::Value::Float(f)) => Some(f),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1192,11 +1197,15 @@ mod tests {
     }
 
     #[test]
-    fn sum_empty_yields_null() {
-        let s = SumAgg.create();
-        match s.finalize().unwrap() {
-            ScalarValue::Float64(None) => {}
-            other => panic!("expected Float64(None), got {other:?}"),
+    fn sum_empty_yields_zero() {
+        // A sum of nothing is 0.0, as in Cypher — for an empty group and for an
+        // all-NULL one.
+        for agg in [&SumAgg as &dyn LocyAggregate, &MSumAgg] {
+            let s = agg.create();
+            assert_eq!(s.finalize().unwrap(), ScalarValue::Float64(Some(0.0)));
+            let mut s = agg.create();
+            s.ingest(&one_col_batch(vec![None, None]), 0).unwrap();
+            assert_eq!(s.finalize().unwrap(), ScalarValue::Float64(Some(0.0)));
         }
     }
 
